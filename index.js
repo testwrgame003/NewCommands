@@ -1601,16 +1601,23 @@ async function registerSlashCommands() {
 
 let rivalRotationRunning = false;
 
-client.once("clientReady", async () => {
-  console.log(`✅ Bot unificado listo como ${client.user.tag}`);
+client.once("ready", async () => {
+  console.log(`✅ Bot conectado como ${client.user.tag}`);
 
   await registerSlashCommands();
 
   try {
+    console.log(`Buscando canal para el panel (${PANEL_CHANNEL_ID})...`);
     const ch = await client.channels.fetch(PANEL_CHANNEL_ID).catch(() => null);
-    if (ch) await sendPanel(ch);
+    
+    if (ch) {
+      await sendPanel(ch);
+      console.log("✅ Panel de control creado/actualizado exitosamente.");
+    } else {
+      console.log("❌ ERROR: No se encontró el canal. Revisa el PANEL_CHANNEL_ID y los permisos del bot.");
+    }
   } catch (err) {
-    console.error("Error enviando panel inicial:", err);
+    console.error("❌ Error enviando panel inicial:", err);
   }
 
   startDailyScheduler();
