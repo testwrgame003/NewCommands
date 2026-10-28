@@ -518,13 +518,19 @@ async function sendPanel(channel) {
   const embed = new EmbedBuilder()
     .setColor(0x5865f2)
     .setTitle("⚡ ZENITH REROLL — CONTROL CENTER")
-    .setDescription(
-      "Manage your reroll accounts, online status, schedules, and Rivals rotations.\n\n" +
-      "🟢 **Status Controls:** Set your Main or Secondary IDs Online/Offline\n" +
-      "🆔 **Account Setup:** Register IDs, update your Heartbeat Name, or switch groups\n" +
-      "🤝 **Rivals Mode:** Matchmaking, Solo Mode, and Yield options"
-    )
+    .setDescription("Select an option from the dropdown below to learn how each button and the new Rivals system works.")
     .setFooter({ text: "All interactions are private (Ephemeral)" });
+
+  // NUEVO: Menú desplegable de ayuda
+  const helpRow = new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId("panel_help_menu")
+      .setPlaceholder("📖 Information & Guides (Select one)")
+      .addOptions([
+        { label: "🔘 Buttons Guide", description: "Learn what each control button does", value: "help_buttons" },
+        { label: "🤝 New Rivals System", description: "How matchmaking and solo-mode work", value: "help_rivals" }
+      ])
+  );
 
   const row1 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId("online").setLabel("Online").setEmoji("🟢").setStyle(ButtonStyle.Success),
@@ -553,7 +559,8 @@ async function sendPanel(channel) {
     new ButtonBuilder().setCustomId("set_offline").setLabel("Force Offline").setEmoji("🛡️").setStyle(ButtonStyle.Danger)
   );
 
-  const panelPayload = { embeds: [embed], components: [row1, row2, row3, row4] };
+  // Agregamos helpRow al principio
+  const panelPayload = { embeds: [embed], components: [helpRow, row1, row2, row3, row4] };
 
   try {
     if (panelData.messageId) {
@@ -945,6 +952,35 @@ client.on("interactionCreate", async (interaction) => {
     // ---------------------------------------------------------
     if (interaction.isStringSelectMenu()) {
       const { customId } = interaction;
+
+      if (customId === "panel_help_menu") {
+        const val = interaction.values[0];
+        
+        if (val === "help_buttons") {
+          return interaction.reply({
+            content: "🔘 **BUTTON GUIDE**\n\n" +
+                     "**🟢 Online / 🔴 Offline:** Changes your active reroll status.\n" +
+                     "**⚡ Online Sec:** Puts your secondary ID online (Not available for Rivals).\n" +
+                     "**🆔 Register Main:** Links your 16-digit game ID to your Discord account.\n" +
+                     "**🔄 Change ID:** Updates your game ID if you reinstall or change accounts.\n" +
+                     "**🏷️ Heartbeat Name:** Sets the exact name your bot sends to the logs.\n" +
+                     "**🎭 Switch Group:** Changes your active role if you have multiple reroll roles.\n" +
+                     "**⏭️ Yield Reroll:** Skips your turn in a Rivals rotation, keeping your partner active continuously.",
+            ephemeral: true
+          });
+        }
+        
+        if (val === "help_rivals") {
+          return interaction.reply({
+            content: "🤝 **HOW THE NEW RIVALS SYSTEM WORKS**\n\n" +
+                     "1️⃣ **No Pre-Registration Needed:** You no longer need to register a duo beforehand. Just press **🟢 Online**.\n" +
+                     "2️⃣ **Live Matchmaking:** When going online, you can choose to join an open session (someone waiting for a partner) or start a new one.\n" +
+                     "3️⃣ **Solo Mode:** If you start a new session and nobody joins, you will reroll in Solo Mode (1 hour ON, 1 hour OFF) automatically while waiting.\n" +
+                     "4️⃣ **Drop-in / Drop-out:** If your partner goes offline, your session doesn't die. You seamlessly return to Solo Mode without losing your spot.",
+            ephemeral: true
+          });
+        }
+      }
 
       if (customId === "role_select") {
         const selected = interaction.values[0];
