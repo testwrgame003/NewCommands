@@ -1,5 +1,6 @@
 const {
   Client,
+  Events,
   GatewayIntentBits,
   EmbedBuilder,
   ActionRowBuilder,
@@ -17,9 +18,17 @@ const {
 
 const { Redis } = require("@upstash/redis");
 
+// ================= ANTI-CRASH LOGS =================
+process.on("unhandledRejection", (reason) => {
+  console.error("🔥 Unhandled Rejection:", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("🔥 Uncaught Exception:", err);
+});
+
 // ================= CONFIGURACIÓN =================
 
-const TOKEN = process.env.TOKEN;
+const TOKEN = process.env.TOKEN || process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const GUILD_ID = process.env.GUILD_ID;
 
@@ -35,7 +44,7 @@ const GROUP_CONFIG = {
 };
 
 const RIVALS_SESSIONS_KEY = "rivals_sessions";
-const RIVAL_ROTATION_MS = 60 * 60 * 1000; // 1 hour
+const RIVAL_ROTATION_MS = 60 * 60 * 1000; // 1 hora
 
 const client = new Client({
   intents: [
@@ -58,7 +67,6 @@ const usersKey = (group) => `users:${group}`;
 const vipKey = (group) => `vip:${group}`;
 const schedulesKey = () => "daily_schedules";
 const panelDataKey = () => "panel_data";
-const activeRolesKey = () => "active_roles";
 
 // ================= PARSERS =================
 
@@ -89,10 +97,6 @@ function cleanGameId(val) {
   if (val === null || val === undefined) return null;
   const digits = String(val).replace(/\D/g, "").trim();
   return /^\d{16}$/.test(digits) ? digits : null;
-}
-
-function isValidGameId(id) {
-  return /^\d{16}$/.test(String(id || "").replace(/\s+/g, "").trim());
 }
 
 function uniqueList(arr) {
@@ -137,7 +141,16 @@ function buildUserData(oldRaw, interaction, updates = {}) {
     heartbeatName
   ]);
 
-  return { ...oldData, ...updates, name, heartbeatName, aliases, main_id: finalMainId, sec_id: finalSecId, updatedAt: Date.now() };
+  return {
+    ...oldData,
+    ...updates,
+    name,
+    heartbeatName,
+    aliases,
+    main_id: finalMainId,
+    sec_id: finalSecId,
+    updatedAt: Date.now()
+  };
 }
 
 // ================= OPERACIONES ATÓMICAS =================
@@ -183,7 +196,10 @@ async function isGameIdAlreadyUsed(id, group, ignoreDiscordId = null) {
 
 async function findUserRegistration(discordId, preferredGroup = null) {
   const allGroups = Object.keys(GROUP_CONFIG);
-  const groups = preferredGroup && GROUP_CONFIG[preferredGroup] ? [preferredGroup, ...allGroups.filter((g) => g !== preferredGroup)] : allGroups;
+  const groups =
+    preferredGroup && GROUP_CONFIG[preferredGroup]
+      ? [preferredGroup, ...allGroups.filter((g) => g !== preferredGroup)]
+      : allGroups;
   for (const group of groups) {
     const userData = await getUser(discordId, group);
     if (userData) return { group, userData };
@@ -194,7 +210,10 @@ async function findUserRegistration(discordId, preferredGroup = null) {
 // ================= ROLES =================
 
 function isChampion(interaction) {
-  return interaction.member?.roles?.cache?.has(CHAMPION_ROLE_ID) || interaction.member?.roles?.cache?.some((r) => r.name === "Champion");
+  return (
+    interaction.member?.roles?.cache?.has(CHAMPION_ROLE_ID) ||
+    interaction.member?.roles?.cache?.some((r) => r.name === "Champion")
+  );
 }
 
 function getGroupLabel(group) {
@@ -203,16 +222,24 @@ function getGroupLabel(group) {
 
 function normalizeSelectableRoleName(roleName) {
   const map = {
-    Trainer: "Trainer", Gym_Leader: "Gym_Leader", "Gym Leader": "Gym_Leader",
-    Elite_Four: "Elite_Four", "Elite Four": "Elite_Four",
-    Rivals: "Rivals", "Rival Duo": "Rivals", "Rival_Duo": "Rivals"
+    Trainer: "Trainer",
+    Gym_Leader: "Gym_Leader",
+    "Gym Leader": "Gym_Leader",
+    Elite_Four: "Elite_Four",
+    "Elite Four": "Elite_Four",
+    Rivals: "Rivals",
+    "Rival Duo": "Rivals",
+    Rival_Duo: "Rivals"
   };
   return map[roleName] || null;
 }
 
 function getMemberSelectableRoles(member) {
   if (!member?.roles?.cache) return [];
-  return member.roles.cache.map((role) => normalizeSelectableRoleName(role.name)).filter(Boolean).filter((g, i, arr) => arr.indexOf(g) === i);
+  return member.roles.cache
+    .map((role) => normalizeSelectableRoleName(role.name))
+    .filter(Boolean)
+    .filter((g, i, arr) => arr.indexOf(g) === i);
 }
 
 async function getActiveRole(userId) {
@@ -237,7 +264,7 @@ async function getUserGroup(interaction) {
   return null;
 }
 
-// ================= ONLINE =================
+// ================= ONLINE & VIP =================
 
 async function getOnlineIDs(group) {
   if (!GROUP_CONFIG[group]) return [];
@@ -256,8 +283,9 @@ async function setOnlineStatus(action, id, group) {
 async function addVipID(id, group) {
   const clean = cleanGameId(id);
   if (!clean || !GROUP_CONFIG[group]) return false;
-  await redis.sadd(vipKey(group), clean);
-  await redis.hset(`${vipKey(group)}:timestamps`, { [clean]: Math.floor(Date.now() / 1000) }).catch(() => {});
+  const targetGroup = group === "Rivals" ? "Elite_Four" : group;
+  await redis.sadd(vipKey(targetGroup), clean);
+  await redis.hset(`${vipKey(targetGroup)}:timestamps`, { [clean]: Math.floor(Date.now() / 1000) }).catch(() => {});
   return true;
 }
 
@@ -265,7 +293,7 @@ async function getOnlineUsersByGroup(group) {
   if (!GROUP_CONFIG[group]) return [];
   const onlineIds = await getOnlineIDs(group);
   if (!onlineIds.length) return [];
-  
+
   const users = await getUsers(group);
   const results = [];
   const activeRivalsIds = new Map();
@@ -283,7 +311,7 @@ async function getOnlineUsersByGroup(group) {
 
   for (const id of onlineIds) {
     if (activeRivalsIds.has(id)) continue;
-    let foundUser = Object.values(users).find(u => u.main_id === id || u.sec_id === id);
+    const foundUser = Object.values(users).find((u) => u.main_id === id || u.sec_id === id);
     results.push({ id, label: foundUser ? foundUser.name : `Unknown (${id})` });
   }
 
@@ -307,7 +335,7 @@ async function getRivalsSessionByUser(discordId) {
   if (!sessionsRaw) return null;
   for (const raw of Object.values(sessionsRaw)) {
     const s = safeJsonParse(raw);
-    if (s && s.members.some(m => m.discordId === String(discordId))) return s;
+    if (s && Array.isArray(s.members) && s.members.some((m) => m.discordId === String(discordId))) return s;
   }
   return null;
 }
@@ -332,8 +360,8 @@ async function activateRivalsSession(sessionId, forceRotation = false) {
     }
 
     let nextIndex = (session.activeIndex + 1) % 2;
-    const m0Yield = session.ceded[session.members[0]?.discordId];
-    const m1Yield = session.members[1] && session.ceded[session.members[1].discordId];
+    const m0Yield = session.ceded?.[session.members[0]?.discordId];
+    const m1Yield = session.members[1] && session.ceded?.[session.members[1].discordId];
 
     if (session.members.length === 2) {
       if (m0Yield && m1Yield) nextIndex = -1;
@@ -359,7 +387,7 @@ async function setRivalsOffline(discordId) {
   const session = await getRivalsSessionByUser(discordId);
   if (!session) return { ok: false, message: "❌ You are not in any active Rivals session." };
 
-  const memberIndex = session.members.findIndex(m => m.discordId === String(discordId));
+  const memberIndex = session.members.findIndex((m) => m.discordId === String(discordId));
   if (memberIndex === -1) return { ok: false, message: "❌ Error finding your member data." };
 
   if (session.activeIndex === memberIndex) {
@@ -426,7 +454,7 @@ async function buildRivalsListMessage() {
 
   for (const raw of Object.values(sessionsRaw)) {
     const s = safeJsonParse(raw);
-    if (!s) continue;
+    if (!s || !Array.isArray(s.members) || !s.members[0]) continue;
 
     const timeElapsed = Date.now() - s.lastRotationAt;
     const timeLeft = Math.max(0, RIVAL_ROTATION_MS - timeElapsed);
@@ -437,8 +465,8 @@ async function buildRivalsListMessage() {
     const m0 = s.members[0];
     const m1 = s.members[1];
 
-    const m0Yield = s.ceded[m0?.discordId] ? " 🚫 *(Yielded)*" : "";
-    const m1Yield = m1 && s.ceded[m1.discordId] ? " 🚫 *(Yielded)*" : "";
+    const m0Yield = s.ceded?.[m0?.discordId] ? " 🚫 *(Yielded)*" : "";
+    const m1Yield = m1 && s.ceded?.[m1.discordId] ? " 🚫 *(Yielded)*" : "";
 
     msg += `User A: <@${m0.discordId}> | ID: \`${m0.gameId}\`${m0Yield}\n`;
     if (m1) {
@@ -477,26 +505,36 @@ async function saveSchedules(data) {
 
 function startDailyScheduler() {
   setInterval(async () => {
-    const schedules = await loadSchedules();
-    const now = new Date();
-    const utcHour = now.getUTCHours();
-    const utcMinute = now.getUTCMinutes();
-    const todayUTC = now.toISOString().slice(0, 10);
-    let changed = false;
+    try {
+      const schedules = await loadSchedules();
+      const now = new Date();
+      const utcHour = now.getUTCHours();
+      const utcMinute = now.getUTCMinutes();
+      const todayUTC = now.toISOString().slice(0, 10);
+      let changed = false;
 
-    for (const userId in schedules) {
-      const s = schedules[userId];
-      if (!s?.group || !s?.main_id) continue;
-      if (s.online_hour === utcHour && s.online_minute === utcMinute && s.last_online !== todayUTC) {
-        const ok = await setOnlineStatus("online", s.main_id, s.group);
-        if (ok) { s.last_online = todayUTC; changed = true; }
+      for (const userId in schedules) {
+        const s = schedules[userId];
+        if (!s?.group || !s?.main_id) continue;
+        if (s.online_hour === utcHour && s.online_minute === utcMinute && s.last_online !== todayUTC) {
+          const ok = await setOnlineStatus("online", s.main_id, s.group);
+          if (ok) {
+            s.last_online = todayUTC;
+            changed = true;
+          }
+        }
+        if (s.offline_hour === utcHour && s.offline_minute === utcMinute && s.last_offline !== todayUTC) {
+          const ok = await setOnlineStatus("offline", s.main_id, s.group);
+          if (ok) {
+            s.last_offline = todayUTC;
+            changed = true;
+          }
+        }
       }
-      if (s.offline_hour === utcHour && s.offline_minute === utcMinute && s.last_offline !== todayUTC) {
-        const ok = await setOnlineStatus("offline", s.main_id, s.group);
-        if (ok) { s.last_offline = todayUTC; changed = true; }
-      }
+      if (changed) await saveSchedules(schedules);
+    } catch (err) {
+      console.error("Error en Daily Scheduler:", err);
     }
-    if (changed) await saveSchedules(schedules);
   }, 60 * 1000);
 }
 
@@ -521,7 +559,6 @@ async function sendPanel(channel) {
     .setDescription("Select an option from the dropdown below to learn how each button and the new Rivals system works.")
     .setFooter({ text: "All interactions are private (Ephemeral)" });
 
-  // NUEVO: Menú desplegable de ayuda
   const helpRow = new ActionRowBuilder().addComponents(
     new StringSelectMenuBuilder()
       .setCustomId("panel_help_menu")
@@ -559,7 +596,6 @@ async function sendPanel(channel) {
     new ButtonBuilder().setCustomId("set_offline").setLabel("Force Offline").setEmoji("🛡️").setStyle(ButtonStyle.Danger)
   );
 
-  // Agregamos helpRow al principio
   const panelPayload = { embeds: [embed], components: [helpRow, row1, row2, row3, row4] };
 
   try {
@@ -574,14 +610,26 @@ async function sendPanel(channel) {
   await savePanelData(panelData);
 }
 
-// ================= COMANDOS =================
+// ================= COMANDOS SLASH =================
 
 async function registerSlashCommands() {
   const commands = [
-    new SlashCommandBuilder().setName("register").setDescription("Register your main game ID").addStringOption((o) => o.setName("id").setDescription("16 digit main ID").setRequired(true)),
-    new SlashCommandBuilder().setName("change").setDescription("Change your main game ID").addStringOption((o) => o.setName("id").setDescription("New 16 digit ID").setRequired(true)),
-    new SlashCommandBuilder().setName("add_sec").setDescription("Register your secondary game ID").addStringOption((o) => o.setName("id").setDescription("16 digit secondary ID").setRequired(true)),
-    new SlashCommandBuilder().setName("heartbeat_name").setDescription("Set your exact heartbeat name").addStringOption((o) => o.setName("name").setDescription("Exact name shown in your heartbeat").setRequired(true)),
+    new SlashCommandBuilder()
+      .setName("register")
+      .setDescription("Register your main game ID")
+      .addStringOption((o) => o.setName("id").setDescription("16 digit main ID").setRequired(true)),
+    new SlashCommandBuilder()
+      .setName("change")
+      .setDescription("Change your main game ID")
+      .addStringOption((o) => o.setName("id").setDescription("New 16 digit ID").setRequired(true)),
+    new SlashCommandBuilder()
+      .setName("add_sec")
+      .setDescription("Register your secondary game ID")
+      .addStringOption((o) => o.setName("id").setDescription("16 digit secondary ID").setRequired(true)),
+    new SlashCommandBuilder()
+      .setName("heartbeat_name")
+      .setDescription("Set your exact heartbeat name")
+      .addStringOption((o) => o.setName("name").setDescription("Exact name shown in your heartbeat").setRequired(true)),
     new SlashCommandBuilder().setName("rivals_list").setDescription("Show all Rivals sessions and active rotation status"),
     new SlashCommandBuilder().setName("yield_reroll").setDescription("Yield your active reroll slot in Rivals"),
     new SlashCommandBuilder().setName("change_rol").setDescription("Select your active reroll group"),
@@ -591,17 +639,31 @@ async function registerSlashCommands() {
     new SlashCommandBuilder().setName("list").setDescription("List registered users in your group"),
     new SlashCommandBuilder().setName("online_list").setDescription("List online users in your group"),
     new SlashCommandBuilder().setName("online_count").setDescription("Shows how many users are online in each group"),
-    new SlashCommandBuilder().setName("schedule_events").setDescription("Daily online/offline scheduler (UTC)")
-      .addStringOption((o) => o.setName("mode").setDescription("Start or Stop").setRequired(true).addChoices({ name: "Start Daily Schedule", value: "start" }, { name: "Stop All Schedules", value: "stop" }))
+    new SlashCommandBuilder()
+      .setName("schedule_events")
+      .setDescription("Daily online/offline scheduler (UTC)")
+      .addStringOption((o) =>
+        o
+          .setName("mode")
+          .setDescription("Start or Stop")
+          .setRequired(true)
+          .addChoices({ name: "Start Daily Schedule", value: "start" }, { name: "Stop All Schedules", value: "stop" })
+      )
       .addIntegerOption((o) => o.setName("online_hour").setDescription("Online Hour (UTC 0-23)"))
       .addIntegerOption((o) => o.setName("online_minute").setDescription("Online Minute (0-59)"))
       .addIntegerOption((o) => o.setName("offline_hour").setDescription("Offline Hour (UTC 0-23)"))
       .addIntegerOption((o) => o.setName("offline_minute").setDescription("Offline Minute (0-59)")),
     new SlashCommandBuilder().setName("set_offline").setDescription("Force a user offline (Champion only)"),
-    new SlashCommandBuilder().setName("add_vip").setDescription("Add VIP ID (Champion only)").addStringOption((o) => o.setName("id").setDescription("16 digit VIP ID").setRequired(true))
+    new SlashCommandBuilder()
+      .setName("add_vip")
+      .setDescription("Add VIP ID (Champion only)")
+      .addStringOption((o) => o.setName("id").setDescription("16 digit VIP ID").setRequired(true))
   ].map((cmd) => cmd.toJSON());
 
-  if (!CLIENT_ID || !GUILD_ID) return;
+  if (!CLIENT_ID || !GUILD_ID) {
+    console.warn("⚠️ CLIENT_ID o GUILD_ID no configurados; omitiendo registro de Slash Commands.");
+    return;
+  }
   const rest = new REST({ version: "10" }).setToken(TOKEN);
   await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
 }
@@ -610,10 +672,14 @@ async function registerSlashCommands() {
 
 async function handleRegisterMain(interaction, rawId) {
   const group = await getUserGroup(interaction);
-  if (!group || !GROUP_CONFIG[group]) return "❌ You must have a valid group role (**Trainer**, **Gym Leader**, **Elite Four**, or **Rivals**).";
+  if (!group || !GROUP_CONFIG[group]) {
+    return "❌ You must have a valid group role (**Trainer**, **Gym Leader**, **Elite Four**, or **Rivals**).";
+  }
   const id = cleanGameId(rawId);
   if (!id) return "❌ ID must be exactly 16 digits.";
-  if (await isGameIdAlreadyUsed(id, group, interaction.user.id)) return `❌ ID \`${id}\` is already registered by another user in **${getGroupLabel(group)}**.`;
+  if (await isGameIdAlreadyUsed(id, group, interaction.user.id)) {
+    return `❌ ID \`${id}\` is already registered by another user in **${getGroupLabel(group)}**.`;
+  }
 
   const oldData = await getUser(interaction.user.id, group);
   const newUserData = buildUserData(oldData, interaction, { main_id: id, sec_id: oldData?.sec_id || null });
@@ -628,7 +694,9 @@ async function handleAddSecondary(interaction, rawSecId) {
   if (!group || !GROUP_CONFIG[group]) return "❌ No valid group detected.";
   const secId = cleanGameId(rawSecId);
   if (!secId) return "❌ Secondary ID must be exactly 16 digits.";
-  if (await isGameIdAlreadyUsed(secId, group, interaction.user.id)) return `❌ ID \`${secId}\` is already registered by another user in **${getGroupLabel(group)}**.`;
+  if (await isGameIdAlreadyUsed(secId, group, interaction.user.id)) {
+    return `❌ ID \`${secId}\` is already registered by another user in **${getGroupLabel(group)}**.`;
+  }
 
   const oldData = await getUser(interaction.user.id, group);
   if (!oldData?.main_id) return "❌ You must register your Main ID first.";
@@ -643,7 +711,9 @@ async function handleChangeMainId(interaction, rawNewId) {
   const group = await getUserGroup(interaction);
   if (!group) return "❌ No active group detected.";
 
-  if (await isGameIdAlreadyUsed(newId, group, interaction.user.id)) return `❌ ID \`${newId}\` is already being used by another user in **${getGroupLabel(group)}**.`;
+  if (await isGameIdAlreadyUsed(newId, group, interaction.user.id)) {
+    return `❌ ID \`${newId}\` is already being used by another user in **${getGroupLabel(group)}**.`;
+  }
 
   const oldData = await getUser(interaction.user.id, group);
   if (!oldData?.main_id) return "❌ You must register first before changing your ID.";
@@ -651,7 +721,7 @@ async function handleChangeMainId(interaction, rawNewId) {
   if (group === "Rivals") {
     const session = await getRivalsSessionByUser(interaction.user.id);
     if (session) {
-      const mIdx = session.members.findIndex(m => m.discordId === interaction.user.id);
+      const mIdx = session.members.findIndex((m) => m.discordId === interaction.user.id);
       if (mIdx !== -1) {
         const oldId = session.members[mIdx].gameId;
         session.members[mIdx].gameId = newId;
@@ -680,7 +750,7 @@ async function handleUpdateHeartbeatName(interaction, rawHbName) {
   if (group === "Rivals") {
     const session = await getRivalsSessionByUser(interaction.user.id);
     if (session) {
-      const mIdx = session.members.findIndex(m => m.discordId === interaction.user.id);
+      const mIdx = session.members.findIndex((m) => m.discordId === interaction.user.id);
       if (mIdx !== -1) {
         session.members[mIdx].heartbeatName = hbName;
         await saveRivalsSession(session);
@@ -698,14 +768,21 @@ async function handleUpdateHeartbeatName(interaction, rawHbName) {
 
 // ================= EVENTOS =================
 
-client.once("clientReady", async () => {
+client.once(Events.ClientReady, async () => {
   console.log(`✅ Bot conectado como ${client.user.tag}`);
-  await registerSlashCommands();
-  
+
+  try {
+    await registerSlashCommands();
+  } catch (err) {
+    console.error("Error registrando Slash Commands:", err);
+  }
+
   try {
     const ch = await client.channels.fetch(PANEL_CHANNEL_ID).catch(() => null);
     if (ch) await sendPanel(ch);
-  } catch (err) {}
+  } catch (err) {
+    console.error("Error enviando el panel:", err);
+  }
 
   startDailyScheduler();
 
@@ -718,7 +795,9 @@ client.once("clientReady", async () => {
           if (s) await activateRivalsSession(s.id, false);
         }
       }
-    } catch (err) {}
+    } catch (err) {
+      console.error("Error rotando sesiones Rivals:", err);
+    }
   }, 60 * 1000);
 });
 
@@ -731,63 +810,74 @@ client.on("interactionCreate", async (interaction) => {
       const { commandName } = interaction;
 
       if (commandName === "register") {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         return interaction.editReply(await handleRegisterMain(interaction, interaction.options.getString("id")));
       }
       if (commandName === "change") {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         return interaction.editReply(await handleChangeMainId(interaction, interaction.options.getString("id")));
       }
       if (commandName === "add_sec") {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         return interaction.editReply(await handleAddSecondary(interaction, interaction.options.getString("id")));
       }
       if (commandName === "heartbeat_name") {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         return interaction.editReply(await handleUpdateHeartbeatName(interaction, interaction.options.getString("name")));
       }
       if (commandName === "yield_reroll") {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         const res = await toggleCedeReroll(interaction.user.id);
         return interaction.editReply(res.message);
       }
       if (commandName === "rivals_list") {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         return interaction.editReply(await buildRivalsListMessage());
       }
       if (commandName === "online_count") {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         const lines = [];
-        for (const group of Object.keys(GROUP_CONFIG)) {
+        for (const group of ["Elite_Four", "Gym_Leader", "Trainer"]) {
           const count = (await getOnlineUsersByGroup(group)).length;
           lines.push(`• **${getGroupLabel(group)}**: \`${count}/${MAX_ONLINE_PER_GROUP}\` online`);
         }
         return interaction.editReply(`## 🟢 Online Users\n\n${lines.join("\n")}`);
       }
       if (commandName === "online") {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         const activeRole = await getUserGroup(interaction);
         if (activeRole === "Rivals") {
           const session = await getRivalsSessionByUser(interaction.user.id);
           if (session) return interaction.editReply("❌ You are already in an active Rivals session.");
           const userData = await getUser(interaction.user.id, "Rivals");
           if (!userData?.main_id) return interaction.editReply("❌ Register your Main ID first.");
-          
-          const menu = new StringSelectMenuBuilder().setCustomId("rivals_target_group").setPlaceholder("Select target group").addOptions([
-            { label: "Elite Four", value: "Elite_Four" }, { label: "Gym Leader", value: "Gym_Leader" }
-          ]);
-          return interaction.editReply({ content: "🎯 Choose the target group where you want to reroll:", components: [new ActionRowBuilder().addComponents(menu)] });
+
+          const menu = new StringSelectMenuBuilder()
+            .setCustomId("rivals_target_group")
+            .setPlaceholder("Select target group")
+            .addOptions([
+              { label: "Elite Four", value: "Elite_Four" },
+              { label: "Gym Leader", value: "Gym_Leader" }
+            ]);
+          return interaction.editReply({
+            content: "🎯 Choose the target group where you want to reroll:",
+            components: [new ActionRowBuilder().addComponents(menu)]
+          });
         }
         if (!activeRole) return interaction.editReply("❌ No active group selected.");
         const found = await findUserRegistration(interaction.user.id, activeRole);
         if (!found?.userData?.main_id) return interaction.editReply("❌ Register your Main ID first.");
         const { userData, group } = found;
-        if ((await getOnlineIDs(group)).length >= MAX_ONLINE_PER_GROUP) return interaction.editReply(`❌ The **${getGroupLabel(group)}** group is full.`);
+        if ((await getOnlineIDs(group)).length >= MAX_ONLINE_PER_GROUP) {
+          return interaction.editReply(`❌ The **${getGroupLabel(group)}** group is full.`);
+        }
         const ok = await setOnlineStatus("online", userData.main_id, group);
-        return interaction.editReply(ok ? `🟢 Main account is now **ONLINE** in **${getGroupLabel(group)}**.` : "❌ Could not set main account online.");
+        return interaction.editReply(
+          ok ? `🟢 Main account is now **ONLINE** in **${getGroupLabel(group)}**.` : "❌ Could not set main account online."
+        );
       }
       if (commandName === "offline") {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         const activeRole = await getUserGroup(interaction);
         if (activeRole === "Rivals") return interaction.editReply((await setRivalsOffline(interaction.user.id)).message);
         if (!activeRole) return interaction.editReply("❌ No active group selected.");
@@ -798,17 +888,19 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.editReply(`🔴 **${found.userData.name}** is now **OFFLINE** in **${getGroupLabel(found.group)}**.`);
       }
       if (commandName === "online_sec") {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         const activeRole = await getUserGroup(interaction);
         if (activeRole === "Rivals") return interaction.editReply("❌ Rivals Mode does not use secondary IDs.");
         if (!activeRole) return interaction.editReply("❌ No active group selected.");
         const found = await findUserRegistration(interaction.user.id, activeRole);
         if (!found?.userData?.sec_id) return interaction.editReply("❌ No secondary ID registered.");
         const ok = await setOnlineStatus("online", found.userData.sec_id, found.group);
-        return interaction.editReply(ok ? `🟢 Secondary account is now **ONLINE** in **${getGroupLabel(found.group)}**.` : "❌ Could not set secondary online.");
+        return interaction.editReply(
+          ok ? `🟢 Secondary account is now **ONLINE** in **${getGroupLabel(found.group)}**.` : "❌ Could not set secondary online."
+        );
       }
       if (commandName === "list") {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         const group = await getUserGroup(interaction);
         if (!group) return interaction.editReply("❌ Select an active group first.");
         const users = await getUsers(group);
@@ -818,7 +910,7 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.editReply(msg.slice(0, 1950));
       }
       if (commandName === "online_list") {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         const group = await getUserGroup(interaction);
         if (!group) return interaction.editReply("❌ No active role selected.");
         if (group === "Rivals") return interaction.editReply(await buildRivalsListMessage());
@@ -830,10 +922,82 @@ client.on("interactionCreate", async (interaction) => {
       }
       if (commandName === "change_rol") {
         const userGroups = getMemberSelectableRoles(interaction.member);
-        if (userGroups.length < 2) return interaction.reply({ content: "⚠️ You need at least 2 group roles to switch.", ephemeral: true });
+        if (userGroups.length < 2) {
+          return interaction.reply({ content: "⚠️ You need at least 2 group roles to switch.", flags: MessageFlags.Ephemeral });
+        }
         const currentRole = (await getActiveRole(interaction.user.id)) || (await getUserGroup(interaction));
-        const menu = new StringSelectMenuBuilder().setCustomId("role_select").setPlaceholder("Select your active group").addOptions(userGroups.map((g) => ({ label: getGroupLabel(g), value: g })));
-        return interaction.reply({ content: `🎭 Current active role: **${getGroupLabel(currentRole)}**\nSelect your new active group:`, components: [new ActionRowBuilder().addComponents(menu)], ephemeral: true });
+        const menu = new StringSelectMenuBuilder()
+          .setCustomId("role_select")
+          .setPlaceholder("Select your active group")
+          .addOptions(userGroups.map((g) => ({ label: getGroupLabel(g), value: g })));
+        return interaction.reply({
+          content: `🎭 Current active role: **${getGroupLabel(currentRole)}**\nSelect your new active group:`,
+          components: [new ActionRowBuilder().addComponents(menu)],
+          flags: MessageFlags.Ephemeral
+        });
+      }
+      if (commandName === "schedule_events") {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        const mode = interaction.options.getString("mode");
+        const schedules = await loadSchedules();
+
+        if (mode === "stop") {
+          delete schedules[interaction.user.id];
+          await saveSchedules(schedules);
+          return interaction.editReply("🛑 Your daily auto-schedule has been stopped.");
+        }
+
+        const group = await getUserGroup(interaction);
+        if (!group || group === "Rivals") return interaction.editReply("❌ Auto-schedule is only available for standard groups.");
+        const userData = await getUser(interaction.user.id, group);
+        if (!userData?.main_id) return interaction.editReply("❌ Register your Main ID first.");
+
+        const onH = interaction.options.getInteger("online_hour");
+        const onM = interaction.options.getInteger("online_minute") ?? 0;
+        const offH = interaction.options.getInteger("offline_hour");
+        const offM = interaction.options.getInteger("offline_minute") ?? 0;
+
+        if (onH === null || offH === null || onH < 0 || onH > 23 || offH < 0 || offH > 23 || onM < 0 || onM > 59 || offM < 0 || offM > 59) {
+          return interaction.editReply("❌ Provide valid UTC hours (0-23) and minutes (0-59).");
+        }
+
+        schedules[interaction.user.id] = {
+          group,
+          main_id: userData.main_id,
+          online_hour: onH,
+          online_minute: onM,
+          offline_hour: offH,
+          offline_minute: offM
+        };
+        await saveSchedules(schedules);
+        return interaction.editReply(
+          `⏰ **Daily Schedule Saved (UTC)**\n🟢 Online: \`${String(onH).padStart(2, "0")}:${String(onM).padStart(2, "0")}\`\n🔴 Offline: \`${String(offH).padStart(2, "0")}:${String(offM).padStart(2, "0")}\``
+        );
+      }
+      if (commandName === "add_vip") {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        if (!isChampion(interaction)) return interaction.editReply("❌ Only **Champion** can add VIP IDs.");
+        const vipId = cleanGameId(interaction.options.getString("id"));
+        if (!vipId) return interaction.editReply("❌ VIP ID must be 16 digits.");
+        const group = (await getUserGroup(interaction)) || "Elite_Four";
+        await addVipID(vipId, group);
+        return interaction.editReply(`👑 VIP ID \`${vipId}\` added to **${getGroupLabel(group)}**.`);
+      }
+      if (commandName === "set_offline") {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        if (!isChampion(interaction)) return interaction.editReply("❌ Only **Champion** can force users offline.");
+        const group = (await getUserGroup(interaction)) || "Elite_Four";
+        const onlineUsers = await getOnlineUsersByGroup(group);
+        if (!onlineUsers.length) return interaction.editReply(`⚫ No users online in **${getGroupLabel(group)}**.`);
+
+        const menu = new StringSelectMenuBuilder()
+          .setCustomId(`force_offline_${group}`)
+          .setPlaceholder("Select user to force offline")
+          .addOptions(onlineUsers.slice(0, 25).map((u) => ({ label: u.label.slice(0, 95), description: u.id, value: u.id })));
+        return interaction.editReply({
+          content: `🛡️ Select a user in **${getGroupLabel(group)}** to force offline:`,
+          components: [new ActionRowBuilder().addComponents(menu)]
+        });
       }
     }
 
@@ -845,26 +1009,80 @@ client.on("interactionCreate", async (interaction) => {
 
       if (customId === "register") {
         const modal = new ModalBuilder().setCustomId("reg_modal").setTitle("Register Main Game ID");
-        modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("id").setLabel("16-Digit Main ID").setStyle(TextInputStyle.Short).setRequired(true)));
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder().setCustomId("id").setLabel("16-Digit Main ID").setStyle(TextInputStyle.Short).setRequired(true)
+          )
+        );
         return interaction.showModal(modal);
       }
       if (customId === "add_sec") {
         const modal = new ModalBuilder().setCustomId("sec_modal").setTitle("Add Secondary Game ID");
-        modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("id").setLabel("16-Digit Secondary ID").setStyle(TextInputStyle.Short).setRequired(true)));
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder().setCustomId("id").setLabel("16-Digit Secondary ID").setStyle(TextInputStyle.Short).setRequired(true)
+          )
+        );
         return interaction.showModal(modal);
       }
       if (customId === "change") {
         const modal = new ModalBuilder().setCustomId("change_modal").setTitle("Change Game ID");
-        modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("id").setLabel("New 16-Digit ID").setStyle(TextInputStyle.Short).setRequired(true)));
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder().setCustomId("id").setLabel("New 16-Digit ID").setStyle(TextInputStyle.Short).setRequired(true)
+          )
+        );
         return interaction.showModal(modal);
       }
       if (customId === "heartbeat_name") {
         const modal = new ModalBuilder().setCustomId("heartbeat_modal").setTitle("Set Heartbeat Name");
-        modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId("name").setLabel("Exact name shown in your heartbeat").setStyle(TextInputStyle.Short).setRequired(true)));
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder()
+              .setCustomId("name")
+              .setLabel("Exact name shown in your heartbeat")
+              .setStyle(TextInputStyle.Short)
+              .setRequired(true)
+          )
+        );
+        return interaction.showModal(modal);
+      }
+      if (customId === "gp") {
+        if (!isChampion(interaction)) {
+          return interaction.reply({ content: "❌ Only **Champion** can add VIP IDs.", flags: MessageFlags.Ephemeral });
+        }
+        const modal = new ModalBuilder().setCustomId("vip_modal").setTitle("Add VIP Game ID");
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder().setCustomId("id").setLabel("16-Digit VIP ID").setStyle(TextInputStyle.Short).setRequired(true)
+          )
+        );
+        return interaction.showModal(modal);
+      }
+      if (customId === "schedule") {
+        const modal = new ModalBuilder().setCustomId("schedule_modal").setTitle("Auto Schedule (UTC)");
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder()
+              .setCustomId("online_time")
+              .setLabel("Online Time UTC (HH:MM or 'stop')")
+              .setPlaceholder("08:00")
+              .setStyle(TextInputStyle.Short)
+              .setRequired(true)
+          ),
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder()
+              .setCustomId("offline_time")
+              .setLabel("Offline Time UTC (HH:MM)")
+              .setPlaceholder("22:00")
+              .setStyle(TextInputStyle.Short)
+              .setRequired(false)
+          )
+        );
         return interaction.showModal(modal);
       }
 
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
       if (customId === "online") {
         const activeRole = await getUserGroup(interaction);
@@ -873,19 +1091,30 @@ client.on("interactionCreate", async (interaction) => {
           if (session) return interaction.editReply("❌ You are already in an active Rivals session.");
           const userData = await getUser(interaction.user.id, "Rivals");
           if (!userData?.main_id) return interaction.editReply("❌ Register your Main ID first.");
-          
-          const menu = new StringSelectMenuBuilder().setCustomId("rivals_target_group").setPlaceholder("Select target group").addOptions([
-            { label: "Elite Four", value: "Elite_Four" }, { label: "Gym Leader", value: "Gym_Leader" }
-          ]);
-          return interaction.editReply({ content: "🎯 Choose the target group where you want to reroll:", components: [new ActionRowBuilder().addComponents(menu)] });
+
+          const menu = new StringSelectMenuBuilder()
+            .setCustomId("rivals_target_group")
+            .setPlaceholder("Select target group")
+            .addOptions([
+              { label: "Elite Four", value: "Elite_Four" },
+              { label: "Gym Leader", value: "Gym_Leader" }
+            ]);
+          return interaction.editReply({
+            content: "🎯 Choose the target group where you want to reroll:",
+            components: [new ActionRowBuilder().addComponents(menu)]
+          });
         }
         if (!activeRole) return interaction.editReply("❌ No active group selected.");
         const found = await findUserRegistration(interaction.user.id, activeRole);
         if (!found?.userData?.main_id) return interaction.editReply("❌ Register your Main ID first.");
         const { group, userData } = found;
-        if ((await getOnlineIDs(group)).length >= MAX_ONLINE_PER_GROUP) return interaction.editReply(`❌ The **${getGroupLabel(group)}** group is full.`);
+        if ((await getOnlineIDs(group)).length >= MAX_ONLINE_PER_GROUP) {
+          return interaction.editReply(`❌ The **${getGroupLabel(group)}** group is full.`);
+        }
         const ok = await setOnlineStatus("online", userData.main_id, group);
-        return interaction.editReply(ok ? `🟢 Main account is **ONLINE** in **${getGroupLabel(group)}**.` : "❌ Could not set online.");
+        return interaction.editReply(
+          ok ? `🟢 Main account is **ONLINE** in **${getGroupLabel(group)}**.` : "❌ Could not set online."
+        );
       }
 
       if (customId === "offline") {
@@ -904,7 +1133,9 @@ client.on("interactionCreate", async (interaction) => {
         const found = await findUserRegistration(interaction.user.id, activeGroup);
         if (!found?.userData?.sec_id) return interaction.editReply("❌ No secondary ID registered.");
         const ok = await setOnlineStatus("online", found.userData.sec_id, found.group);
-        return interaction.editReply(ok ? `🟢 Secondary account is **ONLINE** in **${getGroupLabel(found.group)}**.` : "❌ Could not set secondary online.");
+        return interaction.editReply(
+          ok ? `🟢 Secondary account is **ONLINE** in **${getGroupLabel(found.group)}**.` : "❌ Could not set secondary online."
+        );
       }
 
       if (customId === "list") {
@@ -932,8 +1163,14 @@ client.on("interactionCreate", async (interaction) => {
         const memberGroups = getMemberSelectableRoles(interaction.member);
         if (memberGroups.length < 2) return interaction.editReply("❌ You need at least 2 group roles to switch.");
         const currentRole = (await getActiveRole(interaction.user.id)) || (await getUserGroup(interaction));
-        const menu = new StringSelectMenuBuilder().setCustomId("role_select").setPlaceholder("Select your active role").addOptions(memberGroups.map((g) => ({ label: getGroupLabel(g), value: g })));
-        return interaction.editReply({ content: `🎭 Current active role: **${getGroupLabel(currentRole)}**\nSelect your new active role:`, components: [new ActionRowBuilder().addComponents(menu)] });
+        const menu = new StringSelectMenuBuilder()
+          .setCustomId("role_select")
+          .setPlaceholder("Select your active role")
+          .addOptions(memberGroups.map((g) => ({ label: getGroupLabel(g), value: g })));
+        return interaction.editReply({
+          content: `🎭 Current active role: **${getGroupLabel(currentRole)}**\nSelect your new active role:`,
+          components: [new ActionRowBuilder().addComponents(menu)]
+        });
       }
 
       if (customId === "cede_reroll") {
@@ -941,9 +1178,26 @@ client.on("interactionCreate", async (interaction) => {
         if (activeGroup !== "Rivals") return interaction.editReply("❌ You need the **Rivals** role active to use this.");
         return interaction.editReply((await toggleCedeReroll(interaction.user.id)).message);
       }
-      
+
       if (customId === "rivals_list") {
         return interaction.editReply(await buildRivalsListMessage());
+      }
+
+      if (customId === "set_offline") {
+        if (!isChampion(interaction)) return interaction.editReply("❌ Only **Champion** can force users offline.");
+        const activeGroup = (await getUserGroup(interaction)) || "Elite_Four";
+        const targetGroup = activeGroup === "Rivals" ? "Elite_Four" : activeGroup;
+        const onlineUsers = await getOnlineUsersByGroup(targetGroup);
+        if (!onlineUsers.length) return interaction.editReply(`⚫ No users online in **${getGroupLabel(targetGroup)}**.`);
+
+        const menu = new StringSelectMenuBuilder()
+          .setCustomId(`force_offline_${targetGroup}`)
+          .setPlaceholder("Select user to force offline")
+          .addOptions(onlineUsers.slice(0, 25).map((u) => ({ label: u.label.slice(0, 95), description: u.id, value: u.id })));
+        return interaction.editReply({
+          content: `🛡️ Select a user in **${getGroupLabel(targetGroup)}** to force offline:`,
+          components: [new ActionRowBuilder().addComponents(menu)]
+        });
       }
     }
 
@@ -955,29 +1209,31 @@ client.on("interactionCreate", async (interaction) => {
 
       if (customId === "panel_help_menu") {
         const val = interaction.values[0];
-        
+
         if (val === "help_buttons") {
           return interaction.reply({
-            content: "🔘 **BUTTON GUIDE**\n\n" +
-                     "**🟢 Online / 🔴 Offline:** Changes your active reroll status.\n" +
-                     "**⚡ Online Sec:** Puts your secondary ID online (Not available for Rivals).\n" +
-                     "**🆔 Register Main:** Links your 16-digit game ID to your Discord account.\n" +
-                     "**🔄 Change ID:** Updates your game ID if you reinstall or change accounts.\n" +
-                     "**🏷️ Heartbeat Name:** Sets the exact name your bot sends to the logs.\n" +
-                     "**🎭 Switch Group:** Changes your active role if you have multiple reroll roles.\n" +
-                     "**⏭️ Yield Reroll:** Skips your turn in a Rivals rotation, keeping your partner active continuously.",
-            ephemeral: true
+            content:
+              "🔘 **BUTTON GUIDE**\n\n" +
+              "**🟢 Online / 🔴 Offline:** Changes your active reroll status.\n" +
+              "**⚡ Online Sec:** Puts your secondary ID online (Not available for Rivals).\n" +
+              "**🆔 Register Main:** Links your 16-digit game ID to your Discord account.\n" +
+              "**🔄 Change ID:** Updates your game ID if you reinstall or change accounts.\n" +
+              "**🏷️ Heartbeat Name:** Sets the exact name your bot sends to the logs.\n" +
+              "**🎭 Switch Group:** Changes your active role if you have multiple reroll roles.\n" +
+              "**⏭️ Yield Reroll:** Skips your turn in a Rivals rotation, keeping your partner active continuously.",
+            flags: MessageFlags.Ephemeral
           });
         }
-        
+
         if (val === "help_rivals") {
           return interaction.reply({
-            content: "🤝 **HOW THE NEW RIVALS SYSTEM WORKS**\n\n" +
-                     "1️⃣ **No Pre-Registration Needed:** You no longer need to register a duo beforehand. Just press **🟢 Online**.\n" +
-                     "2️⃣ **Live Matchmaking:** When going online, you can choose to join an open session (someone waiting for a partner) or start a new one.\n" +
-                     "3️⃣ **Solo Mode:** If you start a new session and nobody joins, you will reroll in Solo Mode (1 hour ON, 1 hour OFF) automatically while waiting.\n" +
-                     "4️⃣ **Drop-in / Drop-out:** If your partner goes offline, your session doesn't die. You seamlessly return to Solo Mode without losing your spot.",
-            ephemeral: true
+            content:
+              "🤝 **HOW THE NEW RIVALS SYSTEM WORKS**\n\n" +
+              "1️⃣ **No Pre-Registration Needed:** You no longer need to register a duo beforehand. Just press **🟢 Online**.\n" +
+              "2️⃣ **Live Matchmaking:** When going online, you can choose to join an open session (someone waiting for a partner) or start a new one.\n" +
+              "3️⃣ **Solo Mode:** If you start a new session and nobody joins, you will reroll in Solo Mode (1 hour ON, 1 hour OFF) automatically while waiting.\n" +
+              "4️⃣ **Drop-in / Drop-out:** If your partner goes offline, your session doesn't die. You seamlessly return to Solo Mode without losing your spot.",
+            flags: MessageFlags.Ephemeral
           });
         }
       }
@@ -988,6 +1244,19 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.update({ content: `✅ Active role set to **${getGroupLabel(selected)}**.`, components: [] });
       }
 
+      if (customId.startsWith("force_offline_")) {
+        if (!isChampion(interaction)) {
+          return interaction.update({ content: "❌ Permission denied.", components: [] });
+        }
+        const targetGroup = customId.replace("force_offline_", "");
+        const targetGameId = interaction.values[0];
+        await setOnlineStatus("offline", targetGameId, targetGroup);
+        return interaction.update({
+          content: `🛡️ Forced ID \`${targetGameId}\` **OFFLINE** in **${getGroupLabel(targetGroup)}**.`,
+          components: []
+        });
+      }
+
       if (customId === "rivals_target_group") {
         const targetGroup = interaction.values[0];
         const sessionsRaw = await redis.hgetall(RIVALS_SESSIONS_KEY);
@@ -996,24 +1265,33 @@ client.on("interactionCreate", async (interaction) => {
         if (sessionsRaw) {
           for (const raw of Object.values(sessionsRaw)) {
             const s = safeJsonParse(raw);
-            if (s && s.targetGroup === targetGroup && s.members.length === 1) {
+            if (s && s.targetGroup === targetGroup && Array.isArray(s.members) && s.members.length === 1) {
               openSessions.push(s);
             }
           }
         }
 
         const options = [{ label: "🆕 Start new session (Solo Mode)", value: `new_${targetGroup}` }];
-        openSessions.slice(0, 24).forEach(s => {
+        openSessions.slice(0, 24).forEach((s) => {
           options.push({ label: `🤝 Join ${s.members[0].name}'s Duo`, value: `join_${s.id}` });
         });
 
-        const menu = new StringSelectMenuBuilder().setCustomId("rivals_matchmaking").setPlaceholder("Select an option").addOptions(options);
-        return interaction.update({ content: `🔍 **Matchmaking for ${getGroupLabel(targetGroup)}**\nChoose an open session or start a new one:`, components: [new ActionRowBuilder().addComponents(menu)] });
+        const menu = new StringSelectMenuBuilder()
+          .setCustomId("rivals_matchmaking")
+          .setPlaceholder("Select an option")
+          .addOptions(options);
+        return interaction.update({
+          content: `🔍 **Matchmaking for ${getGroupLabel(targetGroup)}**\nChoose an open session or start a new one:`,
+          components: [new ActionRowBuilder().addComponents(menu)]
+        });
       }
 
       if (customId === "rivals_matchmaking") {
         const val = interaction.values[0];
         const userData = await getUser(interaction.user.id, "Rivals");
+        if (!userData?.main_id) {
+          return interaction.update({ content: "❌ Register your Main ID in Rivals first.", components: [] });
+        }
 
         if (val.startsWith("new_")) {
           const targetGroup = val.replace("new_", "");
@@ -1027,15 +1305,25 @@ client.on("interactionCreate", async (interaction) => {
           };
           await saveRivalsSession(newSession);
           await redis.sadd(onlineKey(targetGroup), userData.main_id);
-          return interaction.update({ content: `✅ **Session created in ${getGroupLabel(targetGroup)}**.\nYou are now rerolling in Solo Mode (1h ON, 1h OFF). Anyone can join you.`, components: [] });
+          return interaction.update({
+            content: `✅ **Session created in ${getGroupLabel(targetGroup)}**.\nYou are now rerolling in Solo Mode (1h ON, 1h OFF). Anyone can join you.`,
+            components: []
+          });
         }
 
         if (val.startsWith("join_")) {
           const sessionId = val.replace("join_", "");
           const session = await getRivalsSessionById(sessionId);
-          if (!session || session.members.length >= 2) return interaction.update({ content: "❌ This session is no longer available.", components: [] });
+          if (!session || session.members.length >= 2) {
+            return interaction.update({ content: "❌ This session is no longer available.", components: [] });
+          }
 
-          session.members.push({ discordId: interaction.user.id, name: userData.name, gameId: userData.main_id, joinedAt: Date.now() });
+          session.members.push({
+            discordId: interaction.user.id,
+            name: userData.name,
+            gameId: userData.main_id,
+            joinedAt: Date.now()
+          });
 
           if (session.activeIndex === 1) {
             session.lastRotationAt = Date.now();
@@ -1045,52 +1333,108 @@ client.on("interactionCreate", async (interaction) => {
           await saveRivalsSession(session);
           try {
             const partner = await client.users.fetch(session.members[0].discordId);
-            await partner.send(`🤝 **Rivals Match!** <@${interaction.user.id}> has joined your Duo session in **${getGroupLabel(session.targetGroup)}**.`);
+            await partner.send(
+              `🤝 **Rivals Match!** <@${interaction.user.id}> has joined your Duo session in **${getGroupLabel(session.targetGroup)}**.`
+            );
           } catch (e) {}
 
-          const statusText = session.activeIndex === 1 ? "You are ACTIVE immediately!" : "Your partner is currently active. You will rotate in when their hour ends.";
-          return interaction.update({ content: `✅ **Successfully joined ${session.members[0].name}'s Duo.**\n${statusText}`, components: [] });
+          const statusText =
+            session.activeIndex === 1
+              ? "You are ACTIVE immediately!"
+              : "Your partner is currently active. You will rotate in when their hour ends.";
+          return interaction.update({
+            content: `✅ **Successfully joined ${session.members[0].name}'s Duo.**\n${statusText}`,
+            components: []
+          });
         }
       }
     }
-    
+
     // ---------------------------------------------------------
     // 4. MODALS
     // ---------------------------------------------------------
     if (interaction.isModalSubmit()) {
       const { customId } = interaction;
+
       if (customId === "reg_modal") {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         return interaction.editReply(await handleRegisterMain(interaction, interaction.fields.getTextInputValue("id")));
       }
       if (customId === "sec_modal") {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         return interaction.editReply(await handleAddSecondary(interaction, interaction.fields.getTextInputValue("id")));
       }
       if (customId === "change_modal") {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         return interaction.editReply(await handleChangeMainId(interaction, interaction.fields.getTextInputValue("id")));
       }
       if (customId === "heartbeat_modal") {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         return interaction.editReply(await handleUpdateHeartbeatName(interaction, interaction.fields.getTextInputValue("name")));
+      }
+      if (customId === "vip_modal") {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        if (!isChampion(interaction)) return interaction.editReply("❌ Only **Champion** can add VIP IDs.");
+        const vipId = cleanGameId(interaction.fields.getTextInputValue("id"));
+        if (!vipId) return interaction.editReply("❌ VIP ID must be exactly 16 digits.");
+        const group = (await getUserGroup(interaction)) || "Elite_Four";
+        await addVipID(vipId, group);
+        return interaction.editReply(`👑 VIP ID \`${vipId}\` added to **${getGroupLabel(group)}**.`);
+      }
+      if (customId === "schedule_modal") {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        const rawOnline = interaction.fields.getTextInputValue("online_time").trim().toLowerCase();
+        const rawOffline = (interaction.fields.getTextInputValue("offline_time") || "").trim();
+        const schedules = await loadSchedules();
+
+        if (rawOnline === "stop") {
+          delete schedules[interaction.user.id];
+          await saveSchedules(schedules);
+          return interaction.editReply("🛑 Your daily auto-schedule has been stopped.");
+        }
+
+        const group = await getUserGroup(interaction);
+        if (!group || group === "Rivals") return interaction.editReply("❌ Auto-schedule is only available for standard groups.");
+        const userData = await getUser(interaction.user.id, group);
+        if (!userData?.main_id) return interaction.editReply("❌ Register your Main ID first.");
+
+        const mOn = rawOnline.match(/^(\d{1,2}):(\d{2})$/);
+        const mOff = rawOffline.match(/^(\d{1,2}):(\d{2})$/);
+        if (!mOn || !mOff) return interaction.editReply("❌ Invalid format. Use `HH:MM` (e.g. `08:00` and `22:00`) or write `stop`.");
+
+        const onH = Number(mOn[1]);
+        const onM = Number(mOn[2]);
+        const offH = Number(mOff[1]);
+        const offM = Number(mOff[2]);
+
+        if (onH > 23 || offH > 23 || onM > 59 || offM > 59) {
+          return interaction.editReply("❌ Invalid time values. Hours must be 0-23 and minutes 0-59.");
+        }
+
+        schedules[interaction.user.id] = {
+          group,
+          main_id: userData.main_id,
+          online_hour: onH,
+          online_minute: onM,
+          offline_hour: offH,
+          offline_minute: offM
+        };
+        await saveSchedules(schedules);
+        return interaction.editReply(
+          `⏰ **Daily Schedule Saved (UTC)**\n🟢 Online: \`${String(onH).padStart(2, "0")}:${String(onM).padStart(2, "0")}\`\n🔴 Offline: \`${String(offH).padStart(2, "0")}:${String(offM).padStart(2, "0")}\``
+        );
       }
     }
   } catch (err) {
     console.error("❌ Interaction error:", err);
-    if (!interaction.replied && !interaction.deferred) await interaction.reply({ content: "❌ Internal error.", ephemeral: true }).catch(() => {});
-    else await interaction.editReply({ content: "❌ Internal error." }).catch(() => {});
+    if (!interaction.replied && !interaction.deferred) {
+      await interaction.reply({ content: "❌ Internal error.", flags: MessageFlags.Ephemeral }).catch(() => {});
+    } else {
+      await interaction.editReply({ content: "❌ Internal error." }).catch(() => {});
+    }
   }
 });
 
-// ================= VIP DETECTION =================
-client.on("messageCreate", async (message) => {
-  if (message.author.bot && !message.webhookId) return;
-  const group = Object.keys(GROUP_CONFIG).find(g => g === "Elite_Four" || g === "Gym_Leader" || g === "Trainer"); // Simplification for mapped channels if required
-  // Ensure the actual CHANNEL_GROUP_MAP is used here in production if logic requires channel matching.
-});
-
 client.on("error", (err) => console.error("Discord client error:", err));
-process.on("unhandledRejection", (err) => console.error("Unhandled rejection:", err));
 
 client.login(TOKEN);
