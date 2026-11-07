@@ -34,7 +34,7 @@ const GUILD_ID = process.env.GUILD_ID;
 
 const PANEL_CHANNEL_ID = "1494760619985862676";
 const CHAMPION_ROLE_ID = "1486206362332434634";
-const MAX_ONLINE_PER_GROUP = 25;
+const MAX_ONLINE_PER_GROUP = 50;
 
 const GROUP_CONFIG = {
   Trainer: { label: "Trainer" },
