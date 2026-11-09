@@ -153,6 +153,15 @@ function buildUserData(oldRaw, interaction, updates = {}) {
   };
 }
 
+
+async function isFarmModeActive() {
+  try {
+    const val = await redis.get("system:farm_mode");
+    return val === "true" || val === true || val === 1 || val === "1";
+  } catch {
+    return false;
+  }
+}
 // ================= OPERACIONES ATÓMICAS =================
 
 async function getUser(discordId, group) {
@@ -846,28 +855,45 @@ client.on("interactionCreate", async (interaction) => {
       if (commandName === "online") {
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         const activeRole = await getUserGroup(interaction);
+        const farmMode = await isFarmModeActive();
+
         if (activeRole === "Rivals") {
-          const session = await getRivalsSessionByUser(interaction.user.id);
-          if (session) return interaction.editReply("❌ You are already in an active Rivals session.");
           const userData = await getUser(interaction.user.id, "Rivals");
           if (!userData?.main_id) return interaction.editReply("❌ Register your Main ID first.");
 
-          const menu = new StringSelectMenuBuilder()
-            .setCustomId("rivals_target_group")
-            .setPlaceholder("Select target group")
-            .addOptions([
-              { label: "Elite Four", value: "Elite_Four" },
-              { label: "Gym Leader", value: "Gym_Leader" }
-            ]);
-          return interaction.editReply({
-            content: "🎯 Choose the target group where you want to reroll:",
-            components: [new ActionRowBuilder().addComponents(menu)]
-          });
+          if (!farmMode) {
+            // MATCHMAKING NORMAL SI FARM MODE ESTÁ OFF
+            const session = await getRivalsSessionByUser(interaction.user.id);
+            if (session) return interaction.editReply("❌ You are already in an active Rivals session.");
+            
+            const menu = new StringSelectMenuBuilder()
+              .setCustomId("rivals_target_group")
+              .setPlaceholder("Select target group")
+              .addOptions([
+                { label: "Elite Four", value: "Elite_Four" },
+                { label: "Gym Leader", value: "Gym_Leader" }
+              ]);
+            return interaction.editReply({
+              content: "🎯 Choose the target group where you want to reroll:",
+              components: [new ActionRowBuilder().addComponents(menu)]
+            });
+          } else {
+            // SI FARM MODE ESTÁ ON, ENTRA DIRECTO COMO ELITE FOUR / GYM LEADER (BYPASS RIVALS)
+            const targetGroup = "Elite_Four"; // Puedes cambiar el grupo por defecto si lo deseas
+            if ((await getOnlineIDs(targetGroup)).length >= MAX_ONLINE_PER_GROUP) {
+              return interaction.editReply(`❌ The **${getGroupLabel(targetGroup)}** group is full.`);
+            }
+            const ok = await setOnlineStatus("online", userData.main_id, targetGroup);
+            return interaction.editReply(
+              ok ? `🌾 **Farm Mode is ON!** Rivals matchmaking bypassed.\n🟢 Main account is now **ONLINE** in **${getGroupLabel(targetGroup)}**.` : "❌ Could not set main account online."
+            );
+          }
         }
+
         if (!activeRole) return interaction.editReply("❌ No active group selected.");
         const found = await findUserRegistration(interaction.user.id, activeRole);
         if (!found?.userData?.main_id) return interaction.editReply("❌ Register your Main ID first.");
-        const { userData, group } = found;
+        const { group, userData } = found;
         if ((await getOnlineIDs(group)).length >= MAX_ONLINE_PER_GROUP) {
           return interaction.editReply(`❌ The **${getGroupLabel(group)}** group is full.`);
         }
@@ -1084,26 +1110,43 @@ client.on("interactionCreate", async (interaction) => {
 
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
-      if (customId === "online") {
+if (customId === "online") {
         const activeRole = await getUserGroup(interaction);
+        const farmMode = await isFarmModeActive();
+
         if (activeRole === "Rivals") {
-          const session = await getRivalsSessionByUser(interaction.user.id);
-          if (session) return interaction.editReply("❌ You are already in an active Rivals session.");
           const userData = await getUser(interaction.user.id, "Rivals");
           if (!userData?.main_id) return interaction.editReply("❌ Register your Main ID first.");
 
-          const menu = new StringSelectMenuBuilder()
-            .setCustomId("rivals_target_group")
-            .setPlaceholder("Select target group")
-            .addOptions([
-              { label: "Elite Four", value: "Elite_Four" },
-              { label: "Gym Leader", value: "Gym_Leader" }
-            ]);
-          return interaction.editReply({
-            content: "🎯 Choose the target group where you want to reroll:",
-            components: [new ActionRowBuilder().addComponents(menu)]
-          });
+          if (!farmMode) {
+            // MATCHMAKING NORMAL SI FARM MODE ESTÁ OFF
+            const session = await getRivalsSessionByUser(interaction.user.id);
+            if (session) return interaction.editReply("❌ You are already in an active Rivals session.");
+            
+            const menu = new StringSelectMenuBuilder()
+              .setCustomId("rivals_target_group")
+              .setPlaceholder("Select target group")
+              .addOptions([
+                { label: "Elite Four", value: "Elite_Four" },
+                { label: "Gym Leader", value: "Gym_Leader" }
+              ]);
+            return interaction.editReply({
+              content: "🎯 Choose the target group where you want to reroll:",
+              components: [new ActionRowBuilder().addComponents(menu)]
+            });
+          } else {
+            // SI FARM MODE ESTÁ ON, ENTRA DIRECTO COMO ELITE FOUR / GYM LEADER (BYPASS RIVALS)
+            const targetGroup = "Elite_Four"; 
+            if ((await getOnlineIDs(targetGroup)).length >= MAX_ONLINE_PER_GROUP) {
+              return interaction.editReply(`❌ The **${getGroupLabel(targetGroup)}** group is full.`);
+            }
+            const ok = await setOnlineStatus("online", userData.main_id, targetGroup);
+            return interaction.editReply(
+              ok ? `🌾 **Farm Mode is ON!** Rivals matchmaking bypassed.\n🟢 Main account is **ONLINE** in **${getGroupLabel(targetGroup)}**.` : "❌ Could not set online."
+            );
+          }
         }
+
         if (!activeRole) return interaction.editReply("❌ No active group selected.");
         const found = await findUserRegistration(interaction.user.id, activeRole);
         if (!found?.userData?.main_id) return interaction.editReply("❌ Register your Main ID first.");
