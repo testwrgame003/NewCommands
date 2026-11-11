@@ -364,7 +364,7 @@ async function sendPanel(channel) {
     .setDescription("Manage your account status, secondary accounts, group selection, and registration below.")
     .setFooter({ text: "Press 'Guide & Admin' for button instructions • Private responses" });
 
-  // Fila 1: Controles de Estado y Grupo (Online, Offline, Switch Group)
+  // Fila 1: Controles de Estado y Grupo (Online, Offline, Online Sec, Switch Group)
   const row1 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId("online").setLabel("Online").setEmoji("🟢").setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId("offline").setLabel("Offline").setEmoji("🔴").setStyle(ButtonStyle.Danger),
@@ -372,7 +372,7 @@ async function sendPanel(channel) {
     new ButtonBuilder().setCustomId("change_role").setLabel("Switch Group").setEmoji("🎭").setStyle(ButtonStyle.Primary)
   );
 
-  // Fila 2: Configuración de Cuentas (Register, Add Sec, Change ID, Heartbeat Name)
+  // Fila 2: Configuración de Cuentas (Register Main, Add Secondary, Change ID, HB Name)
   const row2 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId("register").setLabel("Register Main").setEmoji("🆔").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("add_sec").setLabel("Add Secondary").setEmoji("➕").setStyle(ButtonStyle.Secondary),
