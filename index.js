@@ -343,7 +343,7 @@ function startDailyScheduler() {
   }, 60 * 1000);
 }
 
-// ================= PANEL DE CONTROL VISUAL (MINIMALISTA Y COMPACTO) =================
+// ================= PANEL DE CONTROL VISUAL (ORGANIZADO Y COMPACTO) =================
 
 async function loadPanelData() {
   const data = await redis.get(panelDataKey());
@@ -361,24 +361,26 @@ async function sendPanel(channel) {
   const embed = new EmbedBuilder()
     .setColor(0x5865f2)
     .setTitle("⚡ ZENITH HEADLESS — CONTROL CENTER")
-    .setDescription("Manage your account status, group selection, and registration below.")
+    .setDescription("Manage your account status, secondary accounts, group selection, and registration below.")
     .setFooter({ text: "Press 'Guide & Admin' for button instructions • Private responses" });
 
-  // Fila 1: Controles principales de Estado y Grupo (3 botones)
+  // Fila 1: Controles de Estado y Grupo (Online, Offline, Switch Group)
   const row1 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("online").setLabel("Set Online").setEmoji("🟢").setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId("offline").setLabel("Set Offline").setEmoji("🔴").setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId("online").setLabel("Online").setEmoji("🟢").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId("offline").setLabel("Offline").setEmoji("🔴").setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId("online_sec").setLabel("Online Sec").setEmoji("⚡").setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId("change_role").setLabel("Switch Group").setEmoji("🎭").setStyle(ButtonStyle.Primary)
   );
 
-  // Fila 2: Configuración de Cuenta e Identidad (3 botones)
+  // Fila 2: Configuración de Cuentas (Register, Add Sec, Change ID, Heartbeat Name)
   const row2 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("register").setLabel("Register ID").setEmoji("🆔").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("register").setLabel("Register Main").setEmoji("🆔").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("add_sec").setLabel("Add Secondary").setEmoji("➕").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("change").setLabel("Change ID").setEmoji("🔄").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("heartbeat_name").setLabel("Heartbeat Name").setEmoji("🏷️").setStyle(ButtonStyle.Secondary)
+    new ButtonBuilder().setCustomId("heartbeat_name").setLabel("HB Name").setEmoji("🏷️").setStyle(ButtonStyle.Secondary)
   );
 
-  // Fila 3: Consultas, Horarios y Panel de Admin/Guía (3 botones)
+  // Fila 3: Consultas, Horarios y Guía/Admin
   const row3 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId("group_status").setLabel("Group Status").setEmoji("📡").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("schedule").setLabel("Auto Schedule").setEmoji("⏰").setStyle(ButtonStyle.Secondary),
@@ -408,6 +410,10 @@ async function registerSlashCommands() {
       .setDescription("Register your 16-digit main game ID")
       .addStringOption((o) => o.setName("id").setDescription("16 digit main ID").setRequired(true)),
     new SlashCommandBuilder()
+      .setName("add_sec")
+      .setDescription("Register your 16-digit secondary game ID")
+      .addStringOption((o) => o.setName("id").setDescription("16 digit secondary ID").setRequired(true)),
+    new SlashCommandBuilder()
       .setName("change")
       .setDescription("Change your registered 16-digit game ID")
       .addStringOption((o) => o.setName("id").setDescription("New 16 digit ID").setRequired(true)),
@@ -416,8 +422,9 @@ async function registerSlashCommands() {
       .setDescription("Set your exact heartbeat name")
       .addStringOption((o) => o.setName("name").setDescription("Exact name shown in your heartbeat").setRequired(true)),
     new SlashCommandBuilder().setName("change_rol").setDescription("Switch between Elite Four and Gym Leader"),
-    new SlashCommandBuilder().setName("online").setDescription("Set your account online in your active group"),
-    new SlashCommandBuilder().setName("offline").setDescription("Set your account offline"),
+    new SlashCommandBuilder().setName("online").setDescription("Set your main account online"),
+    new SlashCommandBuilder().setName("online_sec").setDescription("Set your secondary account online"),
+    new SlashCommandBuilder().setName("offline").setDescription("Set your accounts offline"),
     new SlashCommandBuilder().setName("list").setDescription("List registered users in your group"),
     new SlashCommandBuilder().setName("online_list").setDescription("List online users in your group"),
     new SlashCommandBuilder().setName("online_count").setDescription("Shows how many users are online in each group"),
@@ -468,7 +475,23 @@ async function handleRegisterMain(interaction, rawId) {
   const saved = await saveSingleUser(interaction.user.id, newUserData, group);
   if (!saved) return "❌ Error saving your registration in Redis.";
 
-  return `✅ **ID registered in ${getGroupLabel(group)}**\n🆔 Game ID: \`${newUserData.main_id}\`\n👤 Display Name: **${newUserData.name}**\n📡 Heartbeat Name: **${newUserData.heartbeatName}**`;
+  return `✅ **Main ID registered in ${getGroupLabel(group)}**\n🆔 Main ID: \`${newUserData.main_id}\`\n👤 Display Name: **${newUserData.name}**\n📡 Heartbeat Name: **${newUserData.heartbeatName}**`;
+}
+
+async function handleAddSecondary(interaction, rawSecId) {
+  const group = await getUserGroup(interaction);
+  if (!group || !GROUP_CONFIG[group]) return "❌ No valid group detected.";
+  const secId = cleanGameId(rawSecId);
+  if (!secId) return "❌ Secondary ID must be exactly 16 digits.";
+  if (await isGameIdAlreadyUsed(secId, group, interaction.user.id)) {
+    return `❌ ID \`${secId}\` is already registered by another user in **${getGroupLabel(group)}**.`;
+  }
+
+  const oldData = await getUser(interaction.user.id, group);
+  if (!oldData?.main_id) return "❌ You must register your Main ID first.";
+  const newUserData = buildUserData(oldData, interaction, { sec_id: secId });
+  await saveSingleUser(interaction.user.id, newUserData, group);
+  return `✅ Secondary ID \`${secId}\` added in **${getGroupLabel(group)}**.`;
 }
 
 async function handleChangeMainId(interaction, rawNewId) {
@@ -538,6 +561,10 @@ client.on("interactionCreate", async (interaction) => {
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         return interaction.editReply(await handleRegisterMain(interaction, interaction.options.getString("id")));
       }
+      if (commandName === "add_sec") {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        return interaction.editReply(await handleAddSecondary(interaction, interaction.options.getString("id")));
+      }
       if (commandName === "change") {
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         return interaction.editReply(await handleChangeMainId(interaction, interaction.options.getString("id")));
@@ -569,7 +596,18 @@ client.on("interactionCreate", async (interaction) => {
         }
         const ok = await setOnlineStatus("online", userData.main_id, group);
         return interaction.editReply(
-          ok ? `🟢 Account is now **ONLINE** in **${getGroupLabel(group)}**.` : "❌ Could not set account online."
+          ok ? `🟢 Main account is now **ONLINE** in **${getGroupLabel(group)}**.` : "❌ Could not set account online."
+        );
+      }
+      if (commandName === "online_sec") {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        const activeRole = await getUserGroup(interaction);
+        if (!activeRole) return interaction.editReply("❌ No active group selected.");
+        const found = await findUserRegistration(interaction.user.id, activeRole);
+        if (!found?.userData?.sec_id) return interaction.editReply("❌ No secondary ID registered.");
+        const ok = await setOnlineStatus("online", found.userData.sec_id, found.group);
+        return interaction.editReply(
+          ok ? `🟢 Secondary account is now **ONLINE** in **${getGroupLabel(found.group)}**.` : "❌ Could not set secondary online."
         );
       }
       if (commandName === "offline") {
@@ -706,6 +744,15 @@ client.on("interactionCreate", async (interaction) => {
         );
         return interaction.showModal(modal);
       }
+      if (customId === "add_sec") {
+        const modal = new ModalBuilder().setCustomId("sec_modal").setTitle("Add Secondary Game ID");
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder().setCustomId("id").setLabel("16-Digit Secondary ID").setStyle(TextInputStyle.Short).setRequired(true)
+          )
+        );
+        return interaction.showModal(modal);
+      }
       if (customId === "change") {
         const modal = new ModalBuilder().setCustomId("change_modal").setTitle("Change Game ID");
         modal.addComponents(
@@ -778,7 +825,18 @@ client.on("interactionCreate", async (interaction) => {
         }
         const ok = await setOnlineStatus("online", userData.main_id, group);
         return interaction.editReply(
-          ok ? `🟢 Account is **ONLINE** in **${getGroupLabel(group)}**.` : "❌ Could not set online."
+          ok ? `🟢 Main account is now **ONLINE** in **${getGroupLabel(group)}**.` : "❌ Could not set online."
+        );
+      }
+
+      if (customId === "online_sec") {
+        const activeRole = await getUserGroup(interaction);
+        if (!activeRole) return interaction.editReply("❌ No active group selected.");
+        const found = await findUserRegistration(interaction.user.id, activeRole);
+        if (!found?.userData?.sec_id) return interaction.editReply("❌ No secondary ID registered.");
+        const ok = await setOnlineStatus("online", found.userData.sec_id, found.group);
+        return interaction.editReply(
+          ok ? `🟢 Secondary account is now **ONLINE** in **${getGroupLabel(found.group)}**.` : "❌ Could not set secondary online."
         );
       }
 
@@ -852,9 +910,10 @@ client.on("interactionCreate", async (interaction) => {
           .setColor(0x5865f2)
           .setTitle("📖 Headless System Guide")
           .setDescription(
-            "• **🟢 Set Online / 🔴 Set Offline:** Activates or stops your registered ID in your active group.\n" +
+            "• **🟢 Online / 🔴 Offline:** Activates or stops your registered IDs in your active group.\n" +
+            "• **⚡ Online Sec:** Puts your secondary account online.\n" +
             "• **🎭 Switch Group:** Switch between **Elite Four** and **Gym Leader** if you hold both roles.\n" +
-            "• **🆔 Register / 🔄 Change ID:** Links or updates your 16-digit Friend ID.\n" +
+            "• **🆔 Register / ➕ Add Sec / 🔄 Change:** Links or updates your game IDs.\n" +
             "• **🏷️ Heartbeat Name:** Must match the exact name your bot/host sends in the logs.\n" +
             "• **⏰ Auto Schedule:** Configures automatic daily Online/Offline times in UTC."
           );
@@ -923,6 +982,10 @@ client.on("interactionCreate", async (interaction) => {
       if (customId === "reg_modal") {
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         return interaction.editReply(await handleRegisterMain(interaction, interaction.fields.getTextInputValue("id")));
+      }
+      if (customId === "sec_modal") {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        return interaction.editReply(await handleAddSecondary(interaction, interaction.fields.getTextInputValue("id")));
       }
       if (customId === "change_modal") {
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
