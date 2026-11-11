@@ -343,7 +343,7 @@ function startDailyScheduler() {
   }, 60 * 1000);
 }
 
-// ================= PANEL DE CONTROL VISUAL (DISEÑO LIMPIO 3 FILAS) =================
+// ================= PANEL DE CONTROL VISUAL (MINIMALISTA Y COMPACTO) =================
 
 async function loadPanelData() {
   const data = await redis.get(panelDataKey());
@@ -361,29 +361,8 @@ async function sendPanel(channel) {
   const embed = new EmbedBuilder()
     .setColor(0x5865f2)
     .setTitle("⚡ ZENITH HEADLESS — CONTROL CENTER")
-    .setDescription(
-      "Welcome to the **Headless Reroll Control Panel**. Use the organized sections below to manage your account status and settings.\n" +
-      "───────────────────────────────────────────────"
-    )
-    .addFields(
-      {
-        name: "🟢 1. Status & Group Control",
-        value: "> **Set Online / Set Offline:** Activate or stop your account in your current group.\n> **Switch Group:** Toggle between **Elite Four** & **Gym Leader**.",
-        inline: false
-      },
-      {
-        name: "🆔 2. Account Configuration",
-        value: "> **Register ID / Change ID:** Link or update your 16-digit Friend ID.\n> **Heartbeat Name:** Set your exact bot/host log name.",
-        inline: false
-      },
-      {
-        name: "🛠️ 3. Utilities & Management",
-        value: "> **Group Status:** View online & registered members.\n> **Auto Schedule:** Set daily UTC timers.\n> **Admin & Guide:** Help guide & Champion tools.",
-        inline: false
-      }
-    )
-    .setFooter({ text: "Zenith Headless System • All responses are private (Ephemeral)" })
-    .setTimestamp();
+    .setDescription("Manage your account status, group selection, and registration below.")
+    .setFooter({ text: "Press 'Guide & Admin' for button instructions • Private responses" });
 
   // Fila 1: Controles principales de Estado y Grupo (3 botones)
   const row1 = new ActionRowBuilder().addComponents(
@@ -815,7 +794,6 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.editReply(`🔴 Set **OFFLINE** in **${getGroupLabel(found.group)}**.`);
       }
 
-      // Vista unificada: Online List + Botón para ver la lista completa de registrados
       if (customId === "group_status") {
         const group = await getUserGroup(interaction);
         if (!group) return interaction.editReply("❌ No active group selected.");
@@ -869,7 +847,6 @@ client.on("interactionCreate", async (interaction) => {
         });
       }
 
-      // Guía rápida + Herramientas de Champion ocultas para mantener limpio el panel principal
       if (customId === "admin_and_guide") {
         const guideEmbed = new EmbedBuilder()
           .setColor(0x5865f2)
