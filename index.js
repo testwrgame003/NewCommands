@@ -364,11 +364,11 @@ async function sendPanel(channel) {
     .setDescription("Manage your account status, secondary accounts, group selection, and registration below.")
     .setFooter({ text: "Press 'Guide & Admin' for button instructions • Private responses" });
 
-  // Fila 1: Controles de Estado y Grupo (Online, Offline, Online Sec, Switch Group)
+  // Fila 1: Controles de Estado y Grupo (Online, Online Sec, Offline, Switch Group)
   const row1 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId("online").setLabel("Online").setEmoji("🟢").setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId("offline").setLabel("Offline").setEmoji("🔴").setStyle(ButtonStyle.Danger),
     new ButtonBuilder().setCustomId("online_sec").setLabel("Online Sec").setEmoji("⚡").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId("offline").setLabel("Offline").setEmoji("🔴").setStyle(ButtonStyle.Danger),
     new ButtonBuilder().setCustomId("change_role").setLabel("Switch Group").setEmoji("🎭").setStyle(ButtonStyle.Primary)
   );
 
@@ -380,9 +380,10 @@ async function sendPanel(channel) {
     new ButtonBuilder().setCustomId("heartbeat_name").setLabel("HB Name").setEmoji("🏷️").setStyle(ButtonStyle.Secondary)
   );
 
-  // Fila 3: Consultas, Horarios y Guía/Admin
+  // Fila 3: Consultas y Herramientas (Group Status, Online List, Auto Schedule, Guide & Admin)
   const row3 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId("group_status").setLabel("Group Status").setEmoji("📡").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("online_list").setLabel("Online List").setEmoji("📋").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("schedule").setLabel("Auto Schedule").setEmoji("⏰").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("admin_and_guide").setLabel("Guide & Admin").setEmoji("🛡️").setStyle(ButtonStyle.Primary)
   );
@@ -877,6 +878,16 @@ client.on("interactionCreate", async (interaction) => {
         );
 
         return interaction.editReply({ embeds: [statusEmbed], components: [subRow] });
+      }
+
+      if (customId === "online_list") {
+        const group = await getUserGroup(interaction);
+        if (!group) return interaction.editReply("❌ No active group selected.");
+        const onlineUsers = await getOnlineUsersByGroup(group);
+        if (!onlineUsers.length) return interaction.editReply(`⚫ No users online in **${getGroupLabel(group)}**.`);
+        let msg = `🟢 **Online in ${getGroupLabel(group)}:**\n\n`;
+        for (const u of onlineUsers) msg += `• ${u.label} — \`${u.id}\`\n`;
+        return interaction.editReply(msg.slice(0, 1950));
       }
 
       if (customId === "list") {
