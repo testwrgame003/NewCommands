@@ -360,7 +360,7 @@ async function sendPanel(channel) {
 
   const embed = new EmbedBuilder()
     .setColor(0x5865f2)
-    .setTitle("⚡ ZENITH HEADLESS — CONTROL CENTER")
+    .setTitle("⚡ ZENITH RISE — CONTROL CENTER")
     .setDescription("Manage your account status, secondary accounts, group selection, and registration below.")
     .setFooter({ text: "Press 'Guide & Admin' for button instructions • Private responses" });
 
