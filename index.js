@@ -343,7 +343,7 @@ function startDailyScheduler() {
   }, 60 * 1000);
 }
 
-// ================= PANEL DE CONTROL VISUAL (ORGANIZADO Y COMPACTO) =================
+// ================= PANEL DE CONTROL VISUAL (3 FILAS DE 3 BOTONES) =================
 
 async function loadPanelData() {
   const data = await redis.get(panelDataKey());
@@ -364,27 +364,24 @@ async function sendPanel(channel) {
     .setDescription("Manage your account status, secondary accounts, group selection, and registration below.")
     .setFooter({ text: "Press 'Guide & Admin' for button instructions • Private responses" });
 
-  // Fila 1: Controles de Estado y Grupo (Online, Online Sec, Offline, Switch Group)
+  // Fila 1: Control de Estado (Online Main, Online Sec, Offline) -> 3 botones
   const row1 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId("online").setLabel("Online").setEmoji("🟢").setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId("online_sec").setLabel("Online Sec").setEmoji("⚡").setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId("offline").setLabel("Offline").setEmoji("🔴").setStyle(ButtonStyle.Danger),
-    new ButtonBuilder().setCustomId("change_role").setLabel("Switch Group").setEmoji("🎭").setStyle(ButtonStyle.Primary)
+    new ButtonBuilder().setCustomId("offline").setLabel("Offline").setEmoji("🔴").setStyle(ButtonStyle.Danger)
   );
 
-  // Fila 2: Configuración de Cuentas (Register Main, Add Secondary, Change ID, HB Name)
+  // Fila 2: Configuración de Cuentas (Register, Add Sec, Change ID) -> 3 botones (Textos cortos para evitar saltos de línea)
   const row2 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("register").setLabel("Register Main").setEmoji("🆔").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("add_sec").setLabel("Add Secondary").setEmoji("➕").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("change").setLabel("Change ID").setEmoji("🔄").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("heartbeat_name").setLabel("HB Name").setEmoji("🏷️").setStyle(ButtonStyle.Secondary)
+    new ButtonBuilder().setCustomId("register").setLabel("Register").setEmoji("🆔").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("add_sec").setLabel("Add Sec").setEmoji("➕").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("change").setLabel("Change ID").setEmoji("🔄").setStyle(ButtonStyle.Secondary)
   );
 
-  // Fila 3: Consultas y Herramientas (Group Status, Online List, Auto Schedule, Guide & Admin)
+  // Fila 3: Listas, Horarios, Roles y Guía -> 3 botones equilibrados
   const row3 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("group_status").setLabel("Group Status").setEmoji("📡").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("online_list").setLabel("Online List").setEmoji("📋").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("schedule").setLabel("Auto Schedule").setEmoji("⏰").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("change_role").setLabel("Switch Role").setEmoji("🎭").setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId("admin_and_guide").setLabel("Guide & Admin").setEmoji("🛡️").setStyle(ButtonStyle.Primary)
   );
 
@@ -853,33 +850,6 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.editReply(`🔴 Set **OFFLINE** in **${getGroupLabel(found.group)}**.`);
       }
 
-      if (customId === "group_status") {
-        const group = await getUserGroup(interaction);
-        if (!group) return interaction.editReply("❌ No active group selected.");
-
-        const onlineUsers = await getOnlineUsersByGroup(group);
-        const allUsers = await getUsers(group);
-        const totalReg = Object.keys(allUsers).length;
-
-        const onlineText = onlineUsers.length
-          ? onlineUsers.map((u) => `• **${u.label}** — \`${u.id}\``).join("\n")
-          : "*⚫ No users online right now.*";
-
-        const statusEmbed = new EmbedBuilder()
-          .setColor(0x2ecc71)
-          .setTitle(`📡 ${getGroupLabel(group)} — Group Status`)
-          .setDescription(
-            `**🟢 Currently Online (${onlineUsers.length}/${MAX_ONLINE_PER_GROUP}):**\n${onlineText}\n\n` +
-            `📋 **Total Registered Members:** \`${totalReg}\``
-          );
-
-        const subRow = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId("list").setLabel("View All Registered Members").setEmoji("📋").setStyle(ButtonStyle.Secondary)
-        );
-
-        return interaction.editReply({ embeds: [statusEmbed], components: [subRow] });
-      }
-
       if (customId === "online_list") {
         const group = await getUserGroup(interaction);
         if (!group) return interaction.editReply("❌ No active group selected.");
@@ -887,16 +857,6 @@ client.on("interactionCreate", async (interaction) => {
         if (!onlineUsers.length) return interaction.editReply(`⚫ No users online in **${getGroupLabel(group)}**.`);
         let msg = `🟢 **Online in ${getGroupLabel(group)}:**\n\n`;
         for (const u of onlineUsers) msg += `• ${u.label} — \`${u.id}\`\n`;
-        return interaction.editReply(msg.slice(0, 1950));
-      }
-
-      if (customId === "list") {
-        const group = await getUserGroup(interaction);
-        if (!group) return interaction.editReply("❌ Select an active group first.");
-        const users = await getUsers(group);
-        if (!Object.keys(users).length) return interaction.editReply("📭 No users registered.");
-        let msg = `📋 **Users in ${getGroupLabel(group)}:**\n\n`;
-        for (const u of Object.values(users)) msg += `👤 **${u.name}** | 📡 \`${u.heartbeatName}\` → \`${u.main_id}\`\n`;
         return interaction.editReply(msg.slice(0, 1950));
       }
 
@@ -921,11 +881,10 @@ client.on("interactionCreate", async (interaction) => {
           .setColor(0x5865f2)
           .setTitle("📖 Headless System Guide")
           .setDescription(
-            "• **🟢 Online / 🔴 Offline:** Activates or stops your registered IDs in your active group.\n" +
-            "• **⚡ Online Sec:** Puts your secondary account online.\n" +
-            "• **🎭 Switch Group:** Switch between **Elite Four** and **Gym Leader** if you hold both roles.\n" +
+            "• **🟢 Online / ⚡ Online Sec / 🔴 Offline:** Activates or stops your main and secondary IDs.\n" +
+            "• **🎭 Switch Role:** Switch between **Elite Four** and **Gym Leader** if you hold both roles.\n" +
             "• **🆔 Register / ➕ Add Sec / 🔄 Change:** Links or updates your game IDs.\n" +
-            "• **🏷️ Heartbeat Name:** Must match the exact name your bot/host sends in the logs.\n" +
+            "• **🏷️ HB Name:** Must match the exact name your bot/host sends in the logs.\n" +
             "• **⏰ Auto Schedule:** Configures automatic daily Online/Offline times in UTC."
           );
 
