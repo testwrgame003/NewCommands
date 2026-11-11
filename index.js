@@ -343,7 +343,7 @@ function startDailyScheduler() {
   }, 60 * 1000);
 }
 
-// ================= PANEL DE CONTROL VISUAL (HEADLESS EDITION) =================
+// ================= PANEL DE CONTROL VISUAL (DISEÑO LIMPIO 3 FILAS) =================
 
 async function loadPanelData() {
   const data = await redis.get(panelDataKey());
@@ -362,43 +362,51 @@ async function sendPanel(channel) {
     .setColor(0x5865f2)
     .setTitle("⚡ ZENITH HEADLESS — CONTROL CENTER")
     .setDescription(
-      "Manage your registration, active group (**Elite Four** / **Gym Leader**), and online status for the Headless Reroll System."
+      "Welcome to the **Headless Reroll Control Panel**. Use the organized sections below to manage your account status and settings.\n" +
+      "───────────────────────────────────────────────"
     )
-    .setFooter({ text: "All interactions are private (Ephemeral)" });
+    .addFields(
+      {
+        name: "🟢 1. Status & Group Control",
+        value: "> **Set Online / Set Offline:** Activate or stop your account in your current group.\n> **Switch Group:** Toggle between **Elite Four** & **Gym Leader**.",
+        inline: false
+      },
+      {
+        name: "🆔 2. Account Configuration",
+        value: "> **Register ID / Change ID:** Link or update your 16-digit Friend ID.\n> **Heartbeat Name:** Set your exact bot/host log name.",
+        inline: false
+      },
+      {
+        name: "🛠️ 3. Utilities & Management",
+        value: "> **Group Status:** View online & registered members.\n> **Auto Schedule:** Set daily UTC timers.\n> **Admin & Guide:** Help guide & Champion tools.",
+        inline: false
+      }
+    )
+    .setFooter({ text: "Zenith Headless System • All responses are private (Ephemeral)" })
+    .setTimestamp();
 
-  const helpRow = new ActionRowBuilder().addComponents(
-    new StringSelectMenuBuilder()
-      .setCustomId("panel_help_menu")
-      .setPlaceholder("📖 Information & Control Guide")
-      .addOptions([
-        { label: "🔘 Control Buttons Guide", description: "Learn what each button does in the Headless system", value: "help_buttons" }
-      ])
-  );
-
-  // Fila 1: Estado Online / Offline y Consultas
+  // Fila 1: Controles principales de Estado y Grupo (3 botones)
   const row1 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("online").setLabel("Online").setEmoji("🟢").setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId("offline").setLabel("Offline").setEmoji("🔴").setStyle(ButtonStyle.Danger),
-    new ButtonBuilder().setCustomId("change_role").setLabel("Switch Group").setEmoji("🎭").setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId("online_list").setLabel("Online List").setEmoji("📡").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("list").setLabel("Registered List").setEmoji("📋").setStyle(ButtonStyle.Secondary)
+    new ButtonBuilder().setCustomId("online").setLabel("Set Online").setEmoji("🟢").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId("offline").setLabel("Set Offline").setEmoji("🔴").setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId("change_role").setLabel("Switch Group").setEmoji("🎭").setStyle(ButtonStyle.Primary)
   );
 
-  // Fila 2: Registro y Configuración de Cuenta
+  // Fila 2: Configuración de Cuenta e Identidad (3 botones)
   const row2 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("register").setLabel("Register ID").setEmoji("🆔").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId("register").setLabel("Register ID").setEmoji("🆔").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("change").setLabel("Change ID").setEmoji("🔄").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("heartbeat_name").setLabel("Heartbeat Name").setEmoji("🏷️").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("schedule").setLabel("Auto Schedule (UTC)").setEmoji("⏰").setStyle(ButtonStyle.Secondary)
+    new ButtonBuilder().setCustomId("heartbeat_name").setLabel("Heartbeat Name").setEmoji("🏷️").setStyle(ButtonStyle.Secondary)
   );
 
-  // Fila 3: Herramientas de Champion
+  // Fila 3: Consultas, Horarios y Panel de Admin/Guía (3 botones)
   const row3 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("gp").setLabel("Add VIP ID").setEmoji("👑").setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId("set_offline").setLabel("Force Offline").setEmoji("🛡️").setStyle(ButtonStyle.Danger)
+    new ButtonBuilder().setCustomId("group_status").setLabel("Group Status").setEmoji("📡").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("schedule").setLabel("Auto Schedule").setEmoji("⏰").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("admin_and_guide").setLabel("Guide & Admin").setEmoji("🛡️").setStyle(ButtonStyle.Primary)
   );
 
-  const panelPayload = { embeds: [embed], components: [helpRow, row1, row2, row3] };
+  const panelPayload = { embeds: [embed], components: [row1, row2, row3] };
 
   try {
     if (panelData.messageId) {
@@ -807,6 +815,34 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.editReply(`🔴 Set **OFFLINE** in **${getGroupLabel(found.group)}**.`);
       }
 
+      // Vista unificada: Online List + Botón para ver la lista completa de registrados
+      if (customId === "group_status") {
+        const group = await getUserGroup(interaction);
+        if (!group) return interaction.editReply("❌ No active group selected.");
+
+        const onlineUsers = await getOnlineUsersByGroup(group);
+        const allUsers = await getUsers(group);
+        const totalReg = Object.keys(allUsers).length;
+
+        const onlineText = onlineUsers.length
+          ? onlineUsers.map((u) => `• **${u.label}** — \`${u.id}\``).join("\n")
+          : "*⚫ No users online right now.*";
+
+        const statusEmbed = new EmbedBuilder()
+          .setColor(0x2ecc71)
+          .setTitle(`📡 ${getGroupLabel(group)} — Group Status`)
+          .setDescription(
+            `**🟢 Currently Online (${onlineUsers.length}/${MAX_ONLINE_PER_GROUP}):**\n${onlineText}\n\n` +
+            `📋 **Total Registered Members:** \`${totalReg}\``
+          );
+
+        const subRow = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId("list").setLabel("View All Registered Members").setEmoji("📋").setStyle(ButtonStyle.Secondary)
+        );
+
+        return interaction.editReply({ embeds: [statusEmbed], components: [subRow] });
+      }
+
       if (customId === "list") {
         const group = await getUserGroup(interaction);
         if (!group) return interaction.editReply("❌ Select an active group first.");
@@ -814,16 +850,6 @@ client.on("interactionCreate", async (interaction) => {
         if (!Object.keys(users).length) return interaction.editReply("📭 No users registered.");
         let msg = `📋 **Users in ${getGroupLabel(group)}:**\n\n`;
         for (const u of Object.values(users)) msg += `👤 **${u.name}** | 📡 \`${u.heartbeatName}\` → \`${u.main_id}\`\n`;
-        return interaction.editReply(msg.slice(0, 1950));
-      }
-
-      if (customId === "online_list") {
-        const group = await getUserGroup(interaction);
-        if (!group) return interaction.editReply("❌ No active group selected.");
-        const onlineUsers = await getOnlineUsersByGroup(group);
-        if (!onlineUsers.length) return interaction.editReply(`⚫ No users online in **${getGroupLabel(group)}**.`);
-        let msg = `🟢 **Online in ${getGroupLabel(group)}:**\n\n`;
-        for (const u of onlineUsers) msg += `• ${u.label} — \`${u.id}\`\n`;
         return interaction.editReply(msg.slice(0, 1950));
       }
 
@@ -841,6 +867,31 @@ client.on("interactionCreate", async (interaction) => {
           content: `🎭 Current active group: **${getGroupLabel(currentRole)}**\nSelect your new active group:`,
           components: [new ActionRowBuilder().addComponents(menu)]
         });
+      }
+
+      // Guía rápida + Herramientas de Champion ocultas para mantener limpio el panel principal
+      if (customId === "admin_and_guide") {
+        const guideEmbed = new EmbedBuilder()
+          .setColor(0x5865f2)
+          .setTitle("📖 Headless System Guide")
+          .setDescription(
+            "• **🟢 Set Online / 🔴 Set Offline:** Activates or stops your registered ID in your active group.\n" +
+            "• **🎭 Switch Group:** Switch between **Elite Four** and **Gym Leader** if you hold both roles.\n" +
+            "• **🆔 Register / 🔄 Change ID:** Links or updates your 16-digit Friend ID.\n" +
+            "• **🏷️ Heartbeat Name:** Must match the exact name your bot/host sends in the logs.\n" +
+            "• **⏰ Auto Schedule:** Configures automatic daily Online/Offline times in UTC."
+          );
+
+        const components = [];
+        if (isChampion(interaction)) {
+          const adminRow = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId("gp").setLabel("Add VIP ID").setEmoji("👑").setStyle(ButtonStyle.Success),
+            new ButtonBuilder().setCustomId("set_offline").setLabel("Force User Offline").setEmoji("🛡️").setStyle(ButtonStyle.Danger)
+          );
+          components.push(adminRow);
+        }
+
+        return interaction.editReply({ embeds: [guideEmbed], components });
       }
 
       if (customId === "set_offline") {
@@ -865,23 +916,6 @@ client.on("interactionCreate", async (interaction) => {
     // ---------------------------------------------------------
     if (interaction.isStringSelectMenu()) {
       const { customId } = interaction;
-
-      if (customId === "panel_help_menu") {
-        const val = interaction.values[0];
-        if (val === "help_buttons") {
-          return interaction.reply({
-            content:
-              "🔘 **HEADLESS CONTROL CENTER GUIDE**\n\n" +
-              "**🟢 Online / 🔴 Offline:** Sets your registered account online or offline in your active group (**Elite Four** or **Gym Leader**).\n" +
-              "**🎭 Switch Group:** Switch between **Elite Four** and **Gym Leader** if you have both roles.\n" +
-              "**🆔 Register ID:** Links your 16-digit game ID to your Discord profile.\n" +
-              "**🔄 Change ID:** Updates your 16-digit game ID.\n" +
-              "**🏷️ Heartbeat Name:** Sets the exact name shown in your heartbeat/host logs.\n" +
-              "**⏰ Auto Schedule (UTC):** Automatically sets your account online and offline at your chosen UTC times.",
-            flags: MessageFlags.Ephemeral
-          });
-        }
-      }
 
       if (customId === "role_select") {
         const selected = interaction.values[0];
