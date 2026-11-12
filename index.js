@@ -291,13 +291,17 @@ async function getOnlineUsersByGroup(group) {
 
   for (const id of onlineIds) {
     const foundUser = Object.values(users).find((u) => u.main_id === id || u.sec_id === id);
-    results.push({ id, label: foundUser ? foundUser.name : `Unknown (${id})` });
+    const isSec = foundUser && foundUser.sec_id === id;
+    results.push({
+      id,
+      label: foundUser ? `${foundUser.name}${isSec ? " (Sec)" : ""}` : `Unknown (${id})`
+    });
   }
 
   return results;
 }
 
-// ================= SCHEDULER DIARIO =================
+// ================= MOTOR DE AUTO-SCHEDULE MEJORADO (POR VENTANA DE TIEMPO UTC) =================
 
 async function loadSchedules() {
   const data = await redis.get(schedulesKey());
@@ -308,42 +312,149 @@ async function saveSchedules(data) {
   await redis.set(schedulesKey(), JSON.stringify(data || {}));
 }
 
-function startDailyScheduler() {
-  setInterval(async () => {
-    try {
-      const schedules = await loadSchedules();
-      const now = new Date();
-      const utcHour = now.getUTCHours();
-      const utcMinute = now.getUTCMinutes();
-      const todayUTC = now.toISOString().slice(0, 10);
-      let changed = false;
+function formatTimeHHMM(h, m) {
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+}
 
-      for (const userId in schedules) {
-        const s = schedules[userId];
-        if (!s?.group || !GROUP_CONFIG[s.group] || !s?.main_id) continue;
-        if (s.online_hour === utcHour && s.online_minute === utcMinute && s.last_online !== todayUTC) {
-          const ok = await setOnlineStatus("online", s.main_id, s.group);
-          if (ok) {
-            s.last_online = todayUTC;
-            changed = true;
+/**
+ * Determina si el minuto actual del día (0 - 1439) se encuentra dentro de la ventana [onTotal, offTotal).
+ * Soporta horarios normales (08:00 -> 20:00) y horarios nocturnos que cruzan medianoche (22:00 -> 06:00).
+ */
+function isWithinScheduleWindow(nowMinutes, onMinutes, offMinutes) {
+  if (onMinutes === offMinutes) return false;
+  if (onMinutes < offMinutes) {
+    return nowMinutes >= onMinutes && nowMinutes < offMinutes;
+  } else {
+    // Cruza la medianoche UTC
+    return nowMinutes >= onMinutes || nowMinutes < offMinutes;
+  }
+}
+
+/**
+ * Si el usuario presiona manualmente Online u Offline en el panel teniendo un schedule activo,
+ * guardamos un override para el estado actual de la ventana así el schedule no revierte su acción manual
+ * hasta que empiece el siguiente ciclo de su horario.
+ */
+async function markManualScheduleOverride(discordId, manualAction) {
+  try {
+    const schedules = await loadSchedules();
+    const s = schedules[String(discordId)];
+    if (!s) return;
+
+    const now = new Date();
+    const nowMin = now.getUTCHours() * 60 + now.getUTCMinutes();
+    const onMin = Number(s.online_hour) * 60 + Number(s.online_minute || 0);
+    const offMin = Number(s.offline_hour) * 60 + Number(s.offline_minute || 0);
+    const inWindow = isWithinScheduleWindow(nowMin, onMin, offMin);
+
+    if (manualAction === "offline" && inWindow) {
+      s.manualOverride = "force_off_in_window";
+    } else if (manualAction === "online" && !inWindow) {
+      s.manualOverride = "force_on_out_window";
+    } else {
+      s.manualOverride = null;
+    }
+
+    schedules[String(discordId)] = s;
+    await saveSchedules(schedules);
+  } catch (err) {
+    console.error("Error setting manual schedule override:", err);
+  }
+}
+
+async function enforceSchedulesNow() {
+  try {
+    const schedules = await loadSchedules();
+    const userIds = Object.keys(schedules);
+    if (!userIds.length) return;
+
+    const now = new Date();
+    const nowMin = now.getUTCHours() * 60 + now.getUTCMinutes();
+    let schedulesChanged = false;
+
+    // Cachear listas de online actuales por grupo
+    const onlineSets = {};
+    for (const grp of Object.keys(GROUP_CONFIG)) {
+      onlineSets[grp] = new Set(await getOnlineIDs(grp));
+    }
+
+    for (const userId of userIds) {
+      const s = schedules[userId];
+      if (!s || s.online_hour === undefined || s.offline_hour === undefined) continue;
+
+      // Resolver siempre el registro más reciente del usuario (por si cambió su ID o de grupo)
+      const activeGroup = (await getActiveRole(userId)) || s.group;
+      const found = await findUserRegistration(userId, activeGroup);
+      if (!found || !found.userData?.main_id) continue;
+
+      const targetGroup = found.group;
+      const mainId = found.userData.main_id;
+      const secId = found.userData.sec_id;
+
+      // Mantener sincronizado el schedule con el ID y grupo actuales del usuario
+      if (s.main_id !== mainId || s.group !== targetGroup) {
+        s.main_id = mainId;
+        s.group = targetGroup;
+        schedulesChanged = true;
+      }
+
+      const onMin = Number(s.online_hour) * 60 + Number(s.online_minute || 0);
+      const offMin = Number(s.offline_hour) * 60 + Number(s.offline_minute || 0);
+      const shouldBeOnline = isWithinScheduleWindow(nowMin, onMin, offMin);
+
+      // Limpiar overrides manuales cuando la ventana cambia de fase naturalmente
+      if (shouldBeOnline && s.manualOverride === "force_on_out_window") {
+        s.manualOverride = null;
+        schedulesChanged = true;
+      } else if (!shouldBeOnline && s.manualOverride === "force_off_in_window") {
+        s.manualOverride = null;
+        schedulesChanged = true;
+      }
+
+      const isCurrentlyOnlineInTarget = onlineSets[targetGroup]?.has(mainId);
+
+      if (shouldBeOnline) {
+        // Debe estar ONLINE (a menos que se haya puesto Offline manualmente durante esta ventana)
+        if (s.manualOverride !== "force_off_in_window" && !isCurrentlyOnlineInTarget) {
+          if ((onlineSets[targetGroup]?.size || 0) < MAX_ONLINE_PER_GROUP) {
+            await setOnlineStatus("online", mainId, targetGroup);
+            onlineSets[targetGroup].add(mainId);
+            console.log(`⏰ [AutoSchedule] Set ONLINE: ${found.userData.name} (${mainId}) in ${targetGroup}`);
           }
         }
-        if (s.offline_hour === utcHour && s.offline_minute === utcMinute && s.last_offline !== todayUTC) {
-          const ok = await setOnlineStatus("offline", s.main_id, s.group);
-          if (ok) {
-            s.last_offline = todayUTC;
-            changed = true;
+      } else {
+        // Debe estar OFFLINE en TODOS los grupos (a menos que se haya puesto Online manualmente fuera de su ventana)
+        if (s.manualOverride !== "force_on_out_window") {
+          for (const grp of Object.keys(GROUP_CONFIG)) {
+            if (mainId && onlineSets[grp]?.has(mainId)) {
+              await setOnlineStatus("offline", mainId, grp);
+              onlineSets[grp].delete(mainId);
+              console.log(`⏰ [AutoSchedule] Set OFFLINE (Out of window): ${found.userData.name} (${mainId}) in ${grp}`);
+            }
+            if (secId && onlineSets[grp]?.has(secId)) {
+              await setOnlineStatus("offline", secId, grp);
+              onlineSets[grp].delete(secId);
+            }
           }
         }
       }
-      if (changed) await saveSchedules(schedules);
-    } catch (err) {
-      console.error("Error en Daily Scheduler:", err);
     }
-  }, 60 * 1000);
+
+    if (schedulesChanged) {
+      await saveSchedules(schedules);
+    }
+  } catch (err) {
+    console.error("Error en enforceSchedulesNow:", err);
+  }
 }
 
-// ================= PANEL DE CONTROL VISUAL (3 FILAS DE 3 BOTONES) =================
+function startDailyScheduler() {
+  // Ejecutar inmediatamente al encender el bot y luego cada 30 segundos
+  enforceSchedulesNow();
+  setInterval(enforceSchedulesNow, 30 * 1000);
+}
+
+// ================= PANEL DE CONTROL VISUAL (4 FILAS DE 3 BOTONES SIMÉTRICAS) =================
 
 async function loadPanelData() {
   const data = await redis.get(panelDataKey());
@@ -360,32 +471,39 @@ async function sendPanel(channel) {
 
   const embed = new EmbedBuilder()
     .setColor(0x5865f2)
-    .setTitle("⚡ ZENITH RISE — CONTROL CENTER")
-    .setDescription("Manage your account status, secondary accounts, group selection, and registration below.")
-    .setFooter({ text: "Press 'Guide & Admin' for button instructions • Private responses" });
+    .setTitle("⚡ ZENITH HEADLESS — CONTROL CENTER")
+    .setDescription("Manage your account status, secondary IDs, daily UTC schedule, and group selection below.")
+    .setFooter({ text: "Press 'Guide & Admin' for instructions • All responses are private" });
 
-  // Fila 1: Control de Estado (Online Main, Online Sec, Offline) -> 3 botones
+  // Fila 1: Estado Online / Offline (3 botones)
   const row1 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId("online").setLabel("Online").setEmoji("🟢").setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId("online_sec").setLabel("Online Sec").setEmoji("⚡").setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId("offline").setLabel("Offline").setEmoji("🔴").setStyle(ButtonStyle.Danger)
   );
 
-  // Fila 2: Configuración de Cuentas (Register, Add Sec, Change ID) -> 3 botones (Textos cortos para evitar saltos de línea)
+  // Fila 2: Gestión de IDs (3 botones)
   const row2 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("register").setLabel("Register").setEmoji("🆔").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("add_sec").setLabel("Add Sec").setEmoji("➕").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("register").setLabel("Register Main").setEmoji("🆔").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("add_sec").setLabel("Add Secondary").setEmoji("➕").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("change").setLabel("Change ID").setEmoji("🔄").setStyle(ButtonStyle.Secondary)
   );
 
-  // Fila 3: Listas, Horarios, Roles y Guía -> 3 botones equilibrados
+  // Fila 3: Configuración y Horario (3 botones)
   const row3 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("online_list").setLabel("Online List").setEmoji("📋").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("change_role").setLabel("Switch Role").setEmoji("🎭").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId("heartbeat_name").setLabel("Heartbeat Name").setEmoji("🏷️").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("schedule").setLabel("Auto Schedule").setEmoji("⏰").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId("change_role").setLabel("Switch Group").setEmoji("🎭").setStyle(ButtonStyle.Primary)
+  );
+
+  // Fila 4: Listas y Administración (3 botones)
+  const row4 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("online_list").setLabel("Online List").setEmoji("📡").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("list").setLabel("Registered List").setEmoji("📋").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("admin_and_guide").setLabel("Guide & Admin").setEmoji("🛡️").setStyle(ButtonStyle.Primary)
   );
 
-  const panelPayload = { embeds: [embed], components: [row1, row2, row3] };
+  const panelPayload = { embeds: [embed], components: [row1, row2, row3, row4] };
 
   try {
     if (panelData.messageId) {
@@ -505,9 +623,21 @@ async function handleChangeMainId(interaction, rawNewId) {
   const oldData = await getUser(interaction.user.id, group);
   if (!oldData?.main_id) return "❌ You must register first before changing your ID.";
 
-  if (oldData.main_id && oldData.main_id !== newId) await setOnlineStatus("offline", oldData.main_id, group);
+  if (oldData.main_id && oldData.main_id !== newId) {
+    for (const grp of Object.keys(GROUP_CONFIG)) {
+      await setOnlineStatus("offline", oldData.main_id, grp);
+    }
+  }
   const updated = buildUserData(oldData, interaction, { main_id: newId, sec_id: oldData.sec_id || null });
   await saveSingleUser(interaction.user.id, updated, group);
+
+  // Actualizar también el horario automático si tenía uno activo
+  const schedules = await loadSchedules();
+  if (schedules[interaction.user.id]) {
+    schedules[interaction.user.id].main_id = newId;
+    schedules[interaction.user.id].group = group;
+    await saveSchedules(schedules);
+  }
 
   return `🔄 **Game ID updated in ${getGroupLabel(group)}**\n🆔 New ID: \`${updated.main_id}\`\n👤 Display Name: **${updated.name}**\n📡 Heartbeat Name: **${updated.heartbeatName}**`;
 }
@@ -593,6 +723,7 @@ client.on("interactionCreate", async (interaction) => {
           return interaction.editReply(`❌ The **${getGroupLabel(group)}** group is full.`);
         }
         const ok = await setOnlineStatus("online", userData.main_id, group);
+        if (ok) await markManualScheduleOverride(interaction.user.id, "online");
         return interaction.editReply(
           ok ? `🟢 Main account is now **ONLINE** in **${getGroupLabel(group)}**.` : "❌ Could not set account online."
         );
@@ -620,6 +751,7 @@ client.on("interactionCreate", async (interaction) => {
           if (found.userData.main_id) await setOnlineStatus("offline", found.userData.main_id, grp);
           if (found.userData.sec_id) await setOnlineStatus("offline", found.userData.sec_id, grp);
         }
+        await markManualScheduleOverride(interaction.user.id, "offline");
 
         return interaction.editReply(`🔴 **${found.userData.name}** is now **OFFLINE** in **${getGroupLabel(found.group)}**.`);
       }
@@ -639,8 +771,8 @@ client.on("interactionCreate", async (interaction) => {
         if (!group) return interaction.editReply("❌ No active group selected.");
         const onlineUsers = await getOnlineUsersByGroup(group);
         if (!onlineUsers.length) return interaction.editReply(`⚫ No users online in **${getGroupLabel(group)}**.`);
-        let msg = `🟢 **Online in ${getGroupLabel(group)}:**\n\n`;
-        for (const u of onlineUsers) msg += `• ${u.label} — \`${u.id}\`\n`;
+        let msg = `🟢 **Online in ${getGroupLabel(group)} (${onlineUsers.length}/${MAX_ONLINE_PER_GROUP}):**\n\n`;
+        for (const u of onlineUsers) msg += `• **${u.label}** — \`${u.id}\`\n`;
         return interaction.editReply(msg.slice(0, 1950));
       }
       if (commandName === "change_rol") {
@@ -675,8 +807,8 @@ client.on("interactionCreate", async (interaction) => {
 
         const group = await getUserGroup(interaction);
         if (!group) return interaction.editReply("❌ You need an active group (**Elite Four** or **Gym Leader**).");
-        const userData = await getUser(interaction.user.id, group);
-        if (!userData?.main_id) return interaction.editReply("❌ Register your Game ID first.");
+        const found = await findUserRegistration(interaction.user.id, group);
+        if (!found?.userData?.main_id) return interaction.editReply("❌ Register your Game ID first.");
 
         const onH = interaction.options.getInteger("online_hour");
         const onM = interaction.options.getInteger("online_minute") ?? 0;
@@ -686,18 +818,30 @@ client.on("interactionCreate", async (interaction) => {
         if (onH === null || offH === null || onH < 0 || onH > 23 || offH < 0 || offH > 23 || onM < 0 || onM > 59 || offM < 0 || offM > 59) {
           return interaction.editReply("❌ Provide valid UTC hours (0-23) and minutes (0-59).");
         }
+        if (onH === offH && onM === offM) {
+          return interaction.editReply("❌ Online time and Offline time cannot be identical.");
+        }
 
         schedules[interaction.user.id] = {
-          group,
-          main_id: userData.main_id,
+          group: found.group,
+          main_id: found.userData.main_id,
           online_hour: onH,
           online_minute: onM,
           offline_hour: offH,
-          offline_minute: offM
+          offline_minute: offM,
+          manualOverride: null
         };
         await saveSchedules(schedules);
+        await enforceSchedulesNow();
+
+        const now = new Date();
+        const nowStr = formatTimeHHMM(now.getUTCHours(), now.getUTCMinutes());
+
         return interaction.editReply(
-          `⏰ **Daily Schedule Saved (UTC)**\n🟢 Online: \`${String(onH).padStart(2, "0")}:${String(onM).padStart(2, "0")}\`\n🔴 Offline: \`${String(offH).padStart(2, "0")}:${String(offM).padStart(2, "0")}\``
+          `⏰ **Daily Schedule Active (UTC)**\n` +
+          `🟢 **Online Window:** \`${formatTimeHHMM(onH, onM)}\` ➔ \`${formatTimeHHMM(offH, offM)} UTC\`\n` +
+          `🕒 **Current UTC Time:** \`${nowStr} UTC\`\n` +
+          `*(Your status is now automatically synced with your schedule window).*`
         );
       }
       if (commandName === "add_vip") {
@@ -786,13 +930,19 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.showModal(modal);
       }
       if (customId === "schedule") {
-        const modal = new ModalBuilder().setCustomId("schedule_modal").setTitle("Auto Schedule (UTC)");
+        const schedules = await loadSchedules();
+        const existing = schedules[interaction.user.id];
+        const currentOn = existing ? formatTimeHHMM(existing.online_hour, existing.online_minute) : "";
+        const currentOff = existing ? formatTimeHHMM(existing.offline_hour, existing.offline_minute) : "";
+
+        const modal = new ModalBuilder().setCustomId("schedule_modal").setTitle("Auto Schedule (UTC Time)");
         modal.addComponents(
           new ActionRowBuilder().addComponents(
             new TextInputBuilder()
               .setCustomId("online_time")
-              .setLabel("Online Time UTC (HH:MM or 'stop')")
-              .setPlaceholder("08:00")
+              .setLabel("Online Time UTC (HH:MM or write 'stop')")
+              .setPlaceholder("e.g. 08:00 (or 'stop' to disable)")
+              .setValue(currentOn)
               .setStyle(TextInputStyle.Short)
               .setRequired(true)
           ),
@@ -800,7 +950,8 @@ client.on("interactionCreate", async (interaction) => {
             new TextInputBuilder()
               .setCustomId("offline_time")
               .setLabel("Offline Time UTC (HH:MM)")
-              .setPlaceholder("22:00")
+              .setPlaceholder("e.g. 22:00")
+              .setValue(currentOff)
               .setStyle(TextInputStyle.Short)
               .setRequired(false)
           )
@@ -822,6 +973,7 @@ client.on("interactionCreate", async (interaction) => {
           return interaction.editReply(`❌ The **${getGroupLabel(group)}** group is full.`);
         }
         const ok = await setOnlineStatus("online", userData.main_id, group);
+        if (ok) await markManualScheduleOverride(interaction.user.id, "online");
         return interaction.editReply(
           ok ? `🟢 Main account is now **ONLINE** in **${getGroupLabel(group)}**.` : "❌ Could not set online."
         );
@@ -847,6 +999,7 @@ client.on("interactionCreate", async (interaction) => {
           if (found.userData.main_id) await setOnlineStatus("offline", found.userData.main_id, grp);
           if (found.userData.sec_id) await setOnlineStatus("offline", found.userData.sec_id, grp);
         }
+        await markManualScheduleOverride(interaction.user.id, "offline");
         return interaction.editReply(`🔴 Set **OFFLINE** in **${getGroupLabel(found.group)}**.`);
       }
 
@@ -855,8 +1008,18 @@ client.on("interactionCreate", async (interaction) => {
         if (!group) return interaction.editReply("❌ No active group selected.");
         const onlineUsers = await getOnlineUsersByGroup(group);
         if (!onlineUsers.length) return interaction.editReply(`⚫ No users online in **${getGroupLabel(group)}**.`);
-        let msg = `🟢 **Online in ${getGroupLabel(group)}:**\n\n`;
-        for (const u of onlineUsers) msg += `• ${u.label} — \`${u.id}\`\n`;
+        let msg = `🟢 **Online in ${getGroupLabel(group)} (${onlineUsers.length}/${MAX_ONLINE_PER_GROUP}):**\n\n`;
+        for (const u of onlineUsers) msg += `• **${u.label}** — \`${u.id}\`\n`;
+        return interaction.editReply(msg.slice(0, 1950));
+      }
+
+      if (customId === "list") {
+        const group = await getUserGroup(interaction);
+        if (!group) return interaction.editReply("❌ Select an active group first.");
+        const users = await getUsers(group);
+        if (!Object.keys(users).length) return interaction.editReply("📭 No users registered.");
+        let msg = `📋 **Users in ${getGroupLabel(group)} (${Object.keys(users).length}):**\n\n`;
+        for (const u of Object.values(users)) msg += `👤 **${u.name}** | 📡 \`${u.heartbeatName}\` → \`${u.main_id}\`\n`;
         return interaction.editReply(msg.slice(0, 1950));
       }
 
@@ -877,15 +1040,26 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       if (customId === "admin_and_guide") {
+        const schedules = await loadSchedules();
+        const mySched = schedules[interaction.user.id];
+        const now = new Date();
+        const nowUTC = formatTimeHHMM(now.getUTCHours(), now.getUTCMinutes());
+
+        const schedStatus = mySched
+          ? `🟢 Active (\`${formatTimeHHMM(mySched.online_hour, mySched.online_minute)}\` ➔ \`${formatTimeHHMM(mySched.offline_hour, mySched.offline_minute)} UTC\`)`
+          : `⚪ Disabled`;
+
         const guideEmbed = new EmbedBuilder()
           .setColor(0x5865f2)
-          .setTitle("📖 Headless System Guide")
+          .setTitle("📖 Headless System Guide & Schedule Info")
           .setDescription(
             "• **🟢 Online / ⚡ Online Sec / 🔴 Offline:** Activates or stops your main and secondary IDs.\n" +
-            "• **🎭 Switch Role:** Switch between **Elite Four** and **Gym Leader** if you hold both roles.\n" +
-            "• **🆔 Register / ➕ Add Sec / 🔄 Change:** Links or updates your game IDs.\n" +
-            "• **🏷️ HB Name:** Must match the exact name your bot/host sends in the logs.\n" +
-            "• **⏰ Auto Schedule:** Configures automatic daily Online/Offline times in UTC."
+            "• **🆔 Register Main / ➕ Add Secondary / 🔄 Change ID:** Links or updates your 16-digit game IDs.\n" +
+            "• **🏷️ Heartbeat Name:** Must match the exact name your bot/host sends in the logs.\n" +
+            "• **⏰ Auto Schedule:** Automatically keeps your account **Online** inside your UTC time window and sets it **Offline** outside of it.\n" +
+            "• **🎭 Switch Group:** Switch between **Elite Four** and **Gym Leader** if you hold both roles.\n\n" +
+            `🕒 **Current Server Time (UTC):** \`${nowUTC} UTC\`\n` +
+            `⏰ **Your Auto Schedule:** ${schedStatus}`
           );
 
         const components = [];
@@ -926,6 +1100,14 @@ client.on("interactionCreate", async (interaction) => {
       if (customId === "role_select") {
         const selected = interaction.values[0];
         await setActiveRole(interaction.user.id, selected);
+
+        // Si tiene un horario activo, actualizar el grupo también
+        const schedules = await loadSchedules();
+        if (schedules[interaction.user.id]) {
+          schedules[interaction.user.id].group = selected;
+          await saveSchedules(schedules);
+        }
+
         return interaction.update({ content: `✅ Active group set to **${getGroupLabel(selected)}**.`, components: [] });
       }
 
@@ -980,20 +1162,22 @@ client.on("interactionCreate", async (interaction) => {
         const rawOffline = (interaction.fields.getTextInputValue("offline_time") || "").trim();
         const schedules = await loadSchedules();
 
-        if (rawOnline === "stop") {
+        if (rawOnline === "stop" || rawOnline === "off" || rawOnline === "disable") {
           delete schedules[interaction.user.id];
           await saveSchedules(schedules);
-          return interaction.editReply("🛑 Your daily auto-schedule has been stopped.");
+          return interaction.editReply("🛑 Your daily auto-schedule has been **stopped**.");
         }
 
         const group = await getUserGroup(interaction);
         if (!group) return interaction.editReply("❌ You need an active group (**Elite Four** or **Gym Leader**).");
-        const userData = await getUser(interaction.user.id, group);
-        if (!userData?.main_id) return interaction.editReply("❌ Register your Game ID first.");
+        const found = await findUserRegistration(interaction.user.id, group);
+        if (!found?.userData?.main_id) return interaction.editReply("❌ Register your Game ID first.");
 
         const mOn = rawOnline.match(/^(\d{1,2}):(\d{2})$/);
         const mOff = rawOffline.match(/^(\d{1,2}):(\d{2})$/);
-        if (!mOn || !mOff) return interaction.editReply("❌ Invalid format. Use `HH:MM` (e.g. `08:00` and `22:00`) or write `stop`.");
+        if (!mOn || !mOff) {
+          return interaction.editReply("❌ Invalid format. Use `HH:MM` in 24h UTC format (e.g. `08:00` and `22:00`), or write `stop` to disable.");
+        }
 
         const onH = Number(mOn[1]);
         const onM = Number(mOn[2]);
@@ -1001,20 +1185,34 @@ client.on("interactionCreate", async (interaction) => {
         const offM = Number(mOff[2]);
 
         if (onH > 23 || offH > 23 || onM > 59 || offM > 59) {
-          return interaction.editReply("❌ Invalid time values. Hours must be 0-23 and minutes 0-59.");
+          return interaction.editReply("❌ Invalid time values. Hours must be `00-23` and minutes `00-59`.");
+        }
+        if (onH === offH && onM === offM) {
+          return interaction.editReply("❌ Online time and Offline time cannot be the same.");
         }
 
         schedules[interaction.user.id] = {
-          group,
-          main_id: userData.main_id,
+          group: found.group,
+          main_id: found.userData.main_id,
           online_hour: onH,
           online_minute: onM,
           offline_hour: offH,
-          offline_minute: offM
+          offline_minute: offM,
+          manualOverride: null
         };
         await saveSchedules(schedules);
+        await enforceSchedulesNow();
+
+        const now = new Date();
+        const nowStr = formatTimeHHMM(now.getUTCHours(), now.getUTCMinutes());
+        const nowMin = now.getUTCHours() * 60 + now.getUTCMinutes();
+        const inWin = isWithinScheduleWindow(nowMin, onH * 60 + onM, offH * 60 + offM);
+
         return interaction.editReply(
-          `⏰ **Daily Schedule Saved (UTC)**\n🟢 Online: \`${String(onH).padStart(2, "0")}:${String(onM).padStart(2, "0")}\`\n🔴 Offline: \`${String(offH).padStart(2, "0")}:${String(offM).padStart(2, "0")}\``
+          `⏰ **Daily Schedule Saved & Synced (UTC)**\n` +
+          `🟢 **Online Window:** \`${formatTimeHHMM(onH, onM)}\` ➔ \`${formatTimeHHMM(offH, offM)} UTC\`\n` +
+          `🕒 **Current UTC Time:** \`${nowStr} UTC\`\n` +
+          `📡 **Current State:** ${inWin ? "🟢 **ONLINE** (Inside your window)" : "🔴 **OFFLINE** (Outside your window)"}`
         );
       }
     }
