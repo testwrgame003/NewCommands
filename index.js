@@ -36,7 +36,6 @@ const PANEL_CHANNEL_ID = "1494760619985862676";
 const CHAMPION_ROLE_ID = "1486206362332434634";
 const MAX_ONLINE_PER_GROUP = 50;
 
-// Únicamente grupos Elite Four y Gym Leader
 const GROUP_CONFIG = {
   Gym_Leader: { label: "Gym Leader" },
   Elite_Four: { label: "Elite Four" }
@@ -63,6 +62,9 @@ const usersKey = (group) => `users:${group}`;
 const vipKey = (group) => `vip:${group}`;
 const schedulesKey = () => "daily_schedules";
 const panelDataKey = () => "panel_data";
+
+// Caché en memoria para reducir lecturas repetitivas a Upstash
+let SCHEDULES_CACHE = null;
 
 // ================= PARSERS =================
 
@@ -301,40 +303,35 @@ async function getOnlineUsersByGroup(group) {
   return results;
 }
 
-// ================= MOTOR DE AUTO-SCHEDULE MEJORADO (POR VENTANA DE TIEMPO UTC) =================
+// ================= MOTOR DE AUTO-SCHEDULE OPTIMIZADO (BAJO CONSUMO UPSTASH) =================
 
-async function loadSchedules() {
+async function loadSchedules(forceRefresh = false) {
+  if (!forceRefresh && SCHEDULES_CACHE !== null) {
+    return SCHEDULES_CACHE;
+  }
   const data = await redis.get(schedulesKey());
-  return safeJsonParse(data, {});
+  SCHEDULES_CACHE = safeJsonParse(data, {});
+  return SCHEDULES_CACHE;
 }
 
 async function saveSchedules(data) {
-  await redis.set(schedulesKey(), JSON.stringify(data || {}));
+  SCHEDULES_CACHE = data || {};
+  await redis.set(schedulesKey(), JSON.stringify(SCHEDULES_CACHE));
 }
 
 function formatTimeHHMM(h, m) {
   return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
 }
 
-/**
- * Determina si el minuto actual del día (0 - 1439) se encuentra dentro de la ventana [onTotal, offTotal).
- * Soporta horarios normales (08:00 -> 20:00) y horarios nocturnos que cruzan medianoche (22:00 -> 06:00).
- */
 function isWithinScheduleWindow(nowMinutes, onMinutes, offMinutes) {
   if (onMinutes === offMinutes) return false;
   if (onMinutes < offMinutes) {
     return nowMinutes >= onMinutes && nowMinutes < offMinutes;
   } else {
-    // Cruza la medianoche UTC
     return nowMinutes >= onMinutes || nowMinutes < offMinutes;
   }
 }
 
-/**
- * Si el usuario presiona manualmente Online u Offline en el panel teniendo un schedule activo,
- * guardamos un override para el estado actual de la ventana así el schedule no revierte su acción manual
- * hasta que empiece el siguiente ciclo de su horario.
- */
 async function markManualScheduleOverride(discordId, manualAction) {
   try {
     const schedules = await loadSchedules();
@@ -362,9 +359,10 @@ async function markManualScheduleOverride(discordId, manualAction) {
   }
 }
 
+// Solo hace 2 lecturas de SMEMBERS por ciclo (cada 2 minutos) sin consultar usuarios individuales
 async function enforceSchedulesNow() {
   try {
-    const schedules = await loadSchedules();
+    const schedules = await loadSchedules(false);
     const userIds = Object.keys(schedules);
     if (!userIds.length) return;
 
@@ -372,7 +370,6 @@ async function enforceSchedulesNow() {
     const nowMin = now.getUTCHours() * 60 + now.getUTCMinutes();
     let schedulesChanged = false;
 
-    // Cachear listas de online actuales por grupo
     const onlineSets = {};
     for (const grp of Object.keys(GROUP_CONFIG)) {
       onlineSets[grp] = new Set(await getOnlineIDs(grp));
@@ -380,29 +377,19 @@ async function enforceSchedulesNow() {
 
     for (const userId of userIds) {
       const s = schedules[userId];
-      if (!s || s.online_hour === undefined || s.offline_hour === undefined) continue;
-
-      // Resolver siempre el registro más reciente del usuario (por si cambió su ID o de grupo)
-      const activeGroup = (await getActiveRole(userId)) || s.group;
-      const found = await findUserRegistration(userId, activeGroup);
-      if (!found || !found.userData?.main_id) continue;
-
-      const targetGroup = found.group;
-      const mainId = found.userData.main_id;
-      const secId = found.userData.sec_id;
-
-      // Mantener sincronizado el schedule con el ID y grupo actuales del usuario
-      if (s.main_id !== mainId || s.group !== targetGroup) {
-        s.main_id = mainId;
-        s.group = targetGroup;
-        schedulesChanged = true;
+      if (!s || s.online_hour === undefined || s.offline_hour === undefined || !s.main_id || !GROUP_CONFIG[s.group]) {
+        continue;
       }
+
+      const targetGroup = s.group;
+      const mainId = cleanGameId(s.main_id);
+      const secId = cleanGameId(s.sec_id);
+      if (!mainId) continue;
 
       const onMin = Number(s.online_hour) * 60 + Number(s.online_minute || 0);
       const offMin = Number(s.offline_hour) * 60 + Number(s.offline_minute || 0);
       const shouldBeOnline = isWithinScheduleWindow(nowMin, onMin, offMin);
 
-      // Limpiar overrides manuales cuando la ventana cambia de fase naturalmente
       if (shouldBeOnline && s.manualOverride === "force_on_out_window") {
         s.manualOverride = null;
         schedulesChanged = true;
@@ -414,22 +401,20 @@ async function enforceSchedulesNow() {
       const isCurrentlyOnlineInTarget = onlineSets[targetGroup]?.has(mainId);
 
       if (shouldBeOnline) {
-        // Debe estar ONLINE (a menos que se haya puesto Offline manualmente durante esta ventana)
         if (s.manualOverride !== "force_off_in_window" && !isCurrentlyOnlineInTarget) {
           if ((onlineSets[targetGroup]?.size || 0) < MAX_ONLINE_PER_GROUP) {
             await setOnlineStatus("online", mainId, targetGroup);
             onlineSets[targetGroup].add(mainId);
-            console.log(`⏰ [AutoSchedule] Set ONLINE: ${found.userData.name} (${mainId}) in ${targetGroup}`);
+            console.log(`⏰ [AutoSchedule] Set ONLINE: ${s.name || userId} (${mainId}) in ${targetGroup}`);
           }
         }
       } else {
-        // Debe estar OFFLINE en TODOS los grupos (a menos que se haya puesto Online manualmente fuera de su ventana)
         if (s.manualOverride !== "force_on_out_window") {
           for (const grp of Object.keys(GROUP_CONFIG)) {
             if (mainId && onlineSets[grp]?.has(mainId)) {
               await setOnlineStatus("offline", mainId, grp);
               onlineSets[grp].delete(mainId);
-              console.log(`⏰ [AutoSchedule] Set OFFLINE (Out of window): ${found.userData.name} (${mainId}) in ${grp}`);
+              console.log(`⏰ [AutoSchedule] Set OFFLINE (Out of window): ${s.name || userId} (${mainId}) in ${grp}`);
             }
             if (secId && onlineSets[grp]?.has(secId)) {
               await setOnlineStatus("offline", secId, grp);
@@ -449,12 +434,12 @@ async function enforceSchedulesNow() {
 }
 
 function startDailyScheduler() {
-  // Ejecutar inmediatamente al encender el bot y luego cada 30 segundos
-  enforceSchedulesNow();
-  setInterval(enforceSchedulesNow, 30 * 1000);
+  // Carga inicial desde Redis y luego revisa cada 2 minutos (ahorra 75%+ de comandos)
+  loadSchedules(true).then(() => enforceSchedulesNow());
+  setInterval(enforceSchedulesNow, 2 * 60 * 1000);
 }
 
-// ================= PANEL DE CONTROL VISUAL (4 FILAS DE 3 BOTONES SIMÉTRICAS) =================
+// ================= PANEL DE CONTROL VISUAL =================
 
 async function loadPanelData() {
   const data = await redis.get(panelDataKey());
@@ -475,28 +460,24 @@ async function sendPanel(channel) {
     .setDescription("Manage your account status, secondary IDs, daily UTC schedule, and group selection below.")
     .setFooter({ text: "Press 'Guide & Admin' for instructions • All responses are private" });
 
-  // Fila 1: Estado Online / Offline (3 botones)
   const row1 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId("online").setLabel("Online").setEmoji("🟢").setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId("online_sec").setLabel("Online Sec").setEmoji("⚡").setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId("offline").setLabel("Offline").setEmoji("🔴").setStyle(ButtonStyle.Danger)
   );
 
-  // Fila 2: Gestión de IDs (3 botones)
   const row2 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId("register").setLabel("Register Main").setEmoji("🆔").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("add_sec").setLabel("Add Secondary").setEmoji("➕").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("change").setLabel("Change ID").setEmoji("🔄").setStyle(ButtonStyle.Secondary)
   );
 
-  // Fila 3: Configuración y Horario (3 botones)
   const row3 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId("heartbeat_name").setLabel("Heartbeat Name").setEmoji("🏷️").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("schedule").setLabel("Auto Schedule").setEmoji("⏰").setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId("change_role").setLabel("Switch Group").setEmoji("🎭").setStyle(ButtonStyle.Primary)
   );
 
-  // Fila 4: Listas y Administración (3 botones)
   const row4 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId("online_list").setLabel("Online List").setEmoji("📡").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("list").setLabel("Registered List").setEmoji("📋").setStyle(ButtonStyle.Secondary),
@@ -591,6 +572,14 @@ async function handleRegisterMain(interaction, rawId) {
   const saved = await saveSingleUser(interaction.user.id, newUserData, group);
   if (!saved) return "❌ Error saving your registration in Redis.";
 
+  const schedules = await loadSchedules();
+  if (schedules[interaction.user.id]) {
+    schedules[interaction.user.id].main_id = id;
+    schedules[interaction.user.id].group = group;
+    schedules[interaction.user.id].name = newUserData.name;
+    await saveSchedules(schedules);
+  }
+
   return `✅ **Main ID registered in ${getGroupLabel(group)}**\n🆔 Main ID: \`${newUserData.main_id}\`\n👤 Display Name: **${newUserData.name}**\n📡 Heartbeat Name: **${newUserData.heartbeatName}**`;
 }
 
@@ -607,6 +596,13 @@ async function handleAddSecondary(interaction, rawSecId) {
   if (!oldData?.main_id) return "❌ You must register your Main ID first.";
   const newUserData = buildUserData(oldData, interaction, { sec_id: secId });
   await saveSingleUser(interaction.user.id, newUserData, group);
+
+  const schedules = await loadSchedules();
+  if (schedules[interaction.user.id]) {
+    schedules[interaction.user.id].sec_id = secId;
+    await saveSchedules(schedules);
+  }
+
   return `✅ Secondary ID \`${secId}\` added in **${getGroupLabel(group)}**.`;
 }
 
@@ -631,11 +627,11 @@ async function handleChangeMainId(interaction, rawNewId) {
   const updated = buildUserData(oldData, interaction, { main_id: newId, sec_id: oldData.sec_id || null });
   await saveSingleUser(interaction.user.id, updated, group);
 
-  // Actualizar también el horario automático si tenía uno activo
   const schedules = await loadSchedules();
   if (schedules[interaction.user.id]) {
     schedules[interaction.user.id].main_id = newId;
     schedules[interaction.user.id].group = group;
+    schedules[interaction.user.id].name = updated.name;
     await saveSchedules(schedules);
   }
 
@@ -659,7 +655,7 @@ async function handleUpdateHeartbeatName(interaction, rawHbName) {
 // ================= EVENTOS =================
 
 client.once(Events.ClientReady, async () => {
-  console.log(`✅ Bot Principal (Headless Mode) conectado como ${client.user.tag}`);
+  console.log(`✅ Bot Principal (Headless Optimized) conectado como ${client.user.tag}`);
 
   try {
     await registerSlashCommands();
@@ -824,7 +820,9 @@ client.on("interactionCreate", async (interaction) => {
 
         schedules[interaction.user.id] = {
           group: found.group,
+          name: found.userData.name,
           main_id: found.userData.main_id,
+          sec_id: found.userData.sec_id || null,
           online_hour: onH,
           online_minute: onM,
           offline_hour: offH,
@@ -1101,7 +1099,6 @@ client.on("interactionCreate", async (interaction) => {
         const selected = interaction.values[0];
         await setActiveRole(interaction.user.id, selected);
 
-        // Si tiene un horario activo, actualizar el grupo también
         const schedules = await loadSchedules();
         if (schedules[interaction.user.id]) {
           schedules[interaction.user.id].group = selected;
@@ -1193,7 +1190,9 @@ client.on("interactionCreate", async (interaction) => {
 
         schedules[interaction.user.id] = {
           group: found.group,
+          name: found.userData.name,
           main_id: found.userData.main_id,
+          sec_id: found.userData.sec_id || null,
           online_hour: onH,
           online_minute: onM,
           offline_hour: offH,
